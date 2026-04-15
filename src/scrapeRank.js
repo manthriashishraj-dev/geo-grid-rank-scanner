@@ -12,7 +12,6 @@
  */
 
 import { sleep } from 'crawlee';
-import { Actor } from 'apify';
 import { idsMatch } from './extractPlaceId.js';
 import { buildGridPointUrl } from './generateGrid.js';
 
@@ -81,24 +80,15 @@ export async function checkRankAtPoint({
     } catch {
         const hasDataCid = await page.$('[data-cid]');
         if (!hasDataCid) {
-            // ── Save a diagnostic snapshot if feed is missing ──────────────
-            if (!_diagSaved) {
-                try {
-                    const bodyHtml = await page.evaluate(() => document.body.innerHTML.slice(0, 20000));
-                    const screenshot = await page.screenshot({ type: 'jpeg', quality: 70 });
-                    await Actor.setValue('diag_no_feed_html', bodyHtml, { contentType: 'text/html' });
-                    await Actor.setValue('diag_no_feed_screenshot', screenshot, { contentType: 'image/jpeg' });
-                    _diagSaved = true;
-                } catch { /* ignore */ }
-            }
             return { rank: null, ranked: false, error: 'no_feed' };
         }
     }
 
     await sleep(800);
 
-    // ── On the first grid point, save a full DOM diagnostic ────────────────
+    // ── Diagnostic: log DOM state for first point to actor logs ─────────────
     if (!_diagSaved) {
+        _diagSaved = true; // Set eagerly to avoid duplicate log spam
         try {
             const diagData = await page.evaluate(() => {
                 const feed = document.querySelector('[role="feed"]');
@@ -108,31 +98,27 @@ export async function checkRankAtPoint({
                     url: window.location.href,
                     feedExists: !!feed,
                     feedChildCount: feedChildren.length,
-                    feedOuterHTML: feed ? feed.outerHTML.slice(0, 8000) : null,
-                    allCids: allCidEls.map(el => ({
-                        tag: el.tagName,
-                        cid: el.getAttribute('data-cid'),
-                        id: el.id || null,
-                        cls: el.className || null,
-                    })),
-                    firstCardDetails: feedChildren.slice(0, 5).map((card) => {
+                    // First 3 direct feed children — what do they look like?
+                    firstCards: feedChildren.slice(0, 3).map((card) => {
                         const anchors = Array.from(card.querySelectorAll('a[href]'));
                         return {
-                            outerHTML: card.outerHTML.slice(0, 1000),
-                            tagName: card.tagName,
-                            attributes: Array.from(card.attributes).map(a => `${a.name}="${a.value}"`),
-                            anchors: anchors.map(a => ({ href: a.href, text: a.textContent.slice(0, 50) })),
+                            tag: card.tagName,
+                            attrs: Array.from(card.attributes).map(a => `${a.name}="${a.value.slice(0,60)}"`),
                             dataCid: card.getAttribute('data-cid') || card.querySelector('[data-cid]')?.getAttribute('data-cid') || null,
+                            hrefs: anchors.map(a => a.href).slice(0, 4),
+                            snippet: card.outerHTML.slice(0, 500),
                         };
                     }),
+                    allCids: allCidEls.map(el => el.getAttribute('data-cid')).slice(0, 10),
                 };
             });
-
-            const screenshot = await page.screenshot({ type: 'jpeg', quality: 70 });
-            await Actor.setValue('diag_dom', JSON.stringify(diagData, null, 2), { contentType: 'application/json' });
-            await Actor.setValue('diag_screenshot', screenshot, { contentType: 'image/jpeg' });
-            _diagSaved = true; // Only mark saved AFTER successful write
-        } catch { /* ignore diag errors — _diagSaved stays false so retry can try again */ }
+            // Log to actor output — visible in Apify console
+            console.log('DIAG_START');
+            console.log(JSON.stringify(diagData, null, 2));
+            console.log('DIAG_END');
+        } catch (e) {
+            console.log('DIAG_ERROR:', e.message);
+        }
     }
 
     let seenCount = 0;
