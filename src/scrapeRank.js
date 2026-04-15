@@ -15,6 +15,7 @@
  */
 
 import { sleep } from 'crawlee';
+import { log }   from 'apify';
 import { idsMatch } from './extractPlaceId.js';
 import { buildGridPointUrl } from './generateGrid.js';
 
@@ -22,13 +23,14 @@ const SCROLL_PAUSE_MS   = 1400;
 const CARD_WAIT_MS      = 6000;
 const MAX_SCROLL_ROUNDS = 10;
 
+// Counter used to limit verbose debug output to the first N grid points.
+let _debugPointsLogged = 0;
+const DEBUG_POINT_LIMIT = 2;
+
 // ─── URL ID extractor (Node.js side) ─────────────────────────────────────────
 
 /**
  * Pull all GMB IDs out of a URL string.
- * Mirrors extractAllIdsFromUrl in extractPlaceId.js but kept local so
- * scrapeRank.js is self-contained and can be tested independently.
- *
  * @param {string} url
  * @returns {{ placeId: string|null, hexId: string|null, cid: string|null }}
  */
@@ -89,6 +91,12 @@ export async function checkRankAtPoint({
     maxRankToShow = 20,
     language      = 'en',
 }) {
+    const shouldDebug = _debugPointsLogged < DEBUG_POINT_LIMIT;
+    if (shouldDebug) {
+        _debugPointsLogged++;
+        log.info(`[DEBUG] Checking point (${lat}, ${lng}) | targetIds=${JSON.stringify(targetIds)}`);
+    }
+
     const url = buildGridPointUrl(keyword, lat, lng, language);
 
     // ── Navigate ──────────────────────────────────────────────────────────────
@@ -103,8 +111,12 @@ export async function checkRankAtPoint({
         await page.waitForSelector('[role="feed"]', { timeout: CARD_WAIT_MS });
     } catch {
         // Try alternate selector — Maps sometimes uses a different structure
-        const hasResults = await page.$('[jsaction*="mouseover"][data-cid]');
+        const hasResults = await page.$('[data-cid]');
         if (!hasResults) {
+            if (shouldDebug) {
+                const bodySnippet = await page.evaluate(() => document.body.innerHTML.slice(0, 2000));
+                log.info(`[DEBUG] no_feed — body snippet: ${bodySnippet}`);
+            }
             return { rank: null, ranked: false, error: 'no_feed' };
         }
     }
@@ -127,14 +139,19 @@ export async function checkRankAtPoint({
                 ? Array.from(feed.querySelectorAll(':scope > div'))
                 : [];
 
-            // Fallback: if feed has no direct div children, check for
-            // article-role cards anywhere on the page (alternate Maps layout)
+            // Fallback: article-role cards (alternate Maps layout)
             if (cards.length === 0) {
                 cards = Array.from(document.querySelectorAll('[role="article"]'));
             }
 
+            // Second fallback: anything with data-cid anywhere in the page
+            const allCidEls = document.querySelectorAll('[data-cid]');
+
             return {
                 feedExists,
+                feedChildCount: feedExists ? feed.children.length : 0,
+                feedHTML: feedExists ? feed.outerHTML.slice(0, 1500) : null,
+                allCids: Array.from(allCidEls).map(el => el.getAttribute('data-cid')),
                 cards: cards.map((card) => {
                     // ── data-cid: check the card itself + ALL descendants ──
                     let dataCid = null;
@@ -149,7 +166,6 @@ export async function checkRankAtPoint({
                     if (dataCid && !/^\d+$/.test(dataCid)) dataCid = null;
 
                     // ── Collect ALL hrefs from anchor tags in this card ──
-                    // page.evaluate resolves relative URLs to absolute automatically
                     const hrefs = Array.from(card.querySelectorAll('a[href]'))
                         .map((a) => a.href)
                         .filter(Boolean);
@@ -157,10 +173,26 @@ export async function checkRankAtPoint({
                     // ── jslog may encode a numeric CID: "123456789;..." ──
                     const jslog = card.getAttribute('jslog') || null;
 
-                    return { dataCid, hrefs, jslog };
+                    // ── Capture a small snippet of outer HTML for debugging ──
+                    const snippet = card.outerHTML.slice(0, 300);
+
+                    return { dataCid, hrefs, jslog, snippet };
                 }),
             };
         });
+
+        // ── Debug logging ─────────────────────────────────────────────────────
+        if (shouldDebug && scroll === 0) {
+            log.info(`[DEBUG] feedExists=${extracted.feedExists} feedChildCount=${extracted.feedChildCount} cardCount=${extracted.cards.length}`);
+            log.info(`[DEBUG] allCids on page: ${JSON.stringify(extracted.allCids.slice(0, 10))}`);
+            if (extracted.feedHTML) {
+                log.info(`[DEBUG] feedHTML (first 1500): ${extracted.feedHTML}`);
+            }
+            extracted.cards.slice(0, 3).forEach((c, i) => {
+                log.info(`[DEBUG] card[${i}] dataCid=${c.dataCid} hrefs=${JSON.stringify(c.hrefs.slice(0, 3))} jslog=${c.jslog}`);
+                log.info(`[DEBUG] card[${i}] snippet=${c.snippet}`);
+            });
+        }
 
         if (!extracted.feedExists && seenCount === 0) {
             return { rank: null, ranked: false, error: 'feed_lost' };
