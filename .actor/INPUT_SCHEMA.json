@@ -39,17 +39,19 @@
     "gridSize": {
       "title": "Grid Size (3, 5, 7, or 9)",
       "type": "integer",
-      "description": "Creates an N×N grid of rank-check points. Options: 3 (9 pts, hyper-local), 5 (25 pts, neighbourhood), 7 (49 pts, standard), 9 (81 pts, metro-wide).",
+      "description": "Creates an N×N grid of rank-check points. Enter 3 (9 pts hyper-local), 5 (25 pts neighbourhood), 7 (49 pts standard), or 9 (81 pts metro-wide).",
       "editor": "number",
-      "enum": [3, 5, 7, 9],
+      "minimum": 3,
+      "maximum": 9,
       "default": 7
     },
     "gridSpacingMeters": {
-      "title": "Grid Spacing in meters (300 / 500 / 1000 / 2000)",
+      "title": "Grid Spacing in meters",
       "type": "integer",
-      "description": "Distance between adjacent grid points. Options: 300 (dense city), 500 (standard/optimal), 1000 (suburb), 2000 (rural).",
+      "description": "Distance between adjacent grid points in metres. Enter 300 (dense city), 500 (standard/optimal), 1000 (suburb), or 2000 (rural).",
       "editor": "number",
-      "enum": [300, 500, 1000, 2000],
+      "minimum": 100,
+      "maximum": 5000,
       "default": 500
     },
     "maxRankToShow": {
