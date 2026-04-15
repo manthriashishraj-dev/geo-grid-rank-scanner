@@ -1,76 +1,178 @@
 /**
  * extractPlaceId.js
  *
- * Extracts a normalised Google Place ID from a Google Maps URL or data string.
- * Ported from gmb-scraper-125-fields/src/scrapeSearch.js — same patterns, proven in prod.
+ * Extracts ALL Google-native unique identifiers from a Google Maps URL or DOM card.
+ * No name-based matching — only hard IDs.
  *
- * Priority:
- *  1. Hex-pair  → "0x3a3345fb8f20d4b7:0xf5a5d85edfcb2c8e"  (most common in /maps/search/ URLs)
- *  2. ChIJ base64 → "ChIJN1t_tDeuEmsRUsoyG83frY4"           (Place ID in profile URLs)
- *  3. CID numeric  → "1234567890"                            (legacy format)
+ * Google uses three ID formats for GMB listings:
+ *
+ *  1. ChIJ Place ID  — "ChIJN1t_tDeuEmsRUsoyG83frY4"
+ *     Base64url-encoded, appears in /maps/place/ URLs and API responses.
+ *
+ *  2. Hex-pair       — "0x3a3345fb8f20d4b7:0xf5a5d85edfcb2c8e"
+ *     Two hex values separated by colon. First = location hash, second = CID in hex.
+ *     Most common format in /maps/search/ result card hrefs (the !1s data param).
+ *
+ *  3. CID            — "17559876543210" (numeric)
+ *     The decimal form of the second hex value in a hex-pair.
+ *     Also exposed as data-cid on result cards and in ?cid= query params.
+ *
+ * Cross-format bridge:
+ *   hex-pair "0xAAAA:0xBBBB"  ↔  CID = parseInt("BBBB", 16)
+ *   So any two formats that share the CID value refer to the same business.
  */
 
-/** @param {string} url */
-export function extractPlaceIdFromUrl(url) {
-    if (!url) return null;
+/**
+ * @typedef {Object} GmbIds
+ * @property {string|null} placeId   ChIJ... base64 Place ID
+ * @property {string|null} hexId     0x...:0x... hex-pair
+ * @property {string|null} cid       Numeric CID as string (for safe BigInt handling)
+ */
 
-    // 1. Hex-pair in data param  !1s(0x...:0x...)
+/**
+ * Extract all known GMB unique IDs from a URL string.
+ * @param {string} url
+ * @returns {GmbIds}
+ */
+export function extractAllIdsFromUrl(url) {
+    if (!url) return { placeId: null, hexId: null, cid: null };
+
+    let placeId = null;
+    let hexId   = null;
+    let cid     = null;
+
+    // 1. Hex-pair in data blob  !1s(0x...:0x...)  — most common in search result hrefs
     const hexMatch = url.match(/!1s(0x[a-f0-9]+:0x[a-f0-9]+)/i);
-    if (hexMatch) return hexMatch[1].toLowerCase();
+    if (hexMatch) {
+        hexId = hexMatch[1].toLowerCase();
+        // Derive CID from the second part of the hex-pair
+        const cidHex = hexId.split(':')[1]; // "0xf5a5d..."
+        if (cidHex) {
+            try { cid = BigInt(cidHex).toString(); } catch { /* malformed — skip */ }
+        }
+    }
 
-    // 2. ChIJ base64 in /place/ path or data
-    const chijMatch = url.match(/place\/[^/]*\/(ChIJ[A-Za-z0-9_-]{20,})/);
-    if (chijMatch) return chijMatch[1];
+    // 2. ChIJ Place ID — in /place/{name}/{PlaceId}  or raw in data blob
+    const chijInPath = url.match(/maps\/place\/[^/]*\/(ChIJ[A-Za-z0-9_-]{10,})/);
+    if (chijInPath) {
+        placeId = chijInPath[1];
+    } else {
+        const chijRaw = url.match(/(ChIJ[A-Za-z0-9_-]{10,})/);
+        if (chijRaw) placeId = chijRaw[1];
+    }
 
-    // Also catch it in query string or data blob
-    const chijAlt = url.match(/(ChIJ[A-Za-z0-9_-]{20,})/);
-    if (chijAlt) return chijAlt[1];
+    // 3. CID numeric in ?cid= or &cid= query param (overrides derived value if present)
+    const cidParam = url.match(/[?&]cid=(\d+)/);
+    if (cidParam) cid = cidParam[1];
 
-    // 3. CID numeric
-    const cidMatch = url.match(/[?&]cid=(\d+)/);
-    if (cidMatch) return cidMatch[1];
-
-    return null;
+    return { placeId, hexId, cid };
 }
 
 /**
- * Extracts place_id from a DOM element handle representing a search result card.
- * Works with Playwright page objects.
- *
+ * Extract all known GMB unique IDs from a DOM result card (Playwright element).
  * @param {import('playwright').ElementHandle} card
- * @returns {Promise<string|null>}
+ * @returns {Promise<GmbIds>}
  */
-export async function extractPlaceIdFromCard(card) {
+export async function extractAllIdsFromCard(card) {
+    const result = { placeId: null, hexId: null, cid: null };
+
     try {
-        // Try the anchor href on the card
-        const href = await card.evaluate((el) => {
-            const a = el.querySelector('a[href*="/maps/"]') || el.closest('a[href*="/maps/"]');
-            return a ? a.href : null;
+        // data-cid attribute — Google often puts the numeric CID directly on the card element
+        const dataCid = await card.evaluate((el) => {
+            return el.getAttribute('data-cid')
+                || el.querySelector('[data-cid]')?.getAttribute('data-cid')
+                || null;
         });
-        if (href) {
-            const id = extractPlaceIdFromUrl(href);
-            if (id) return id;
+        if (dataCid && /^\d+$/.test(dataCid)) {
+            result.cid = dataCid;
         }
 
-        // Fallback: aria-label on the card itself sometimes encodes the place
-        const dataId = await card.evaluate((el) => el.getAttribute('data-cid') || el.getAttribute('data-place-id') || null);
-        if (dataId) return dataId;
+        // Anchor href — contains hex-pair and/or ChIJ in the data blob
+        const href = await card.evaluate((el) => {
+            const a = el.querySelector('a[href*="/maps/"]') || el.closest('a[href*="/maps/"]');
+            return a?.href || null;
+        });
+        if (href) {
+            const fromHref = extractAllIdsFromUrl(href);
+            result.placeId = result.placeId || fromHref.placeId;
+            result.hexId   = result.hexId   || fromHref.hexId;
+            result.cid     = result.cid     || fromHref.cid;
+        }
     } catch {
-        // Card may have been detached from DOM during scroll — swallow silently
+        // Card detached from DOM during scroll — return whatever we have
     }
-    return null;
+
+    return result;
 }
 
 /**
- * Normalise a business name for fuzzy fallback matching.
- * Lowercases, strips punctuation, collapses whitespace.
- * @param {string} name
- * @returns {string}
+ * Check if a set of target IDs matches a set of card IDs.
+ * Returns true if any ID format overlaps between the two objects.
+ *
+ * Cross-format bridge: if target has CID, check it against the hex-pair's
+ * second part from the card (and vice-versa).
+ *
+ * @param {GmbIds} target
+ * @param {GmbIds} card
+ * @returns {boolean}
  */
-export function normaliseName(name = '') {
-    return name
-        .toLowerCase()
-        .replace(/[^a-z0-9\s]/g, '')
-        .replace(/\s+/g, ' ')
-        .trim();
+export function idsMatch(target, card) {
+    // Same ChIJ Place ID
+    if (target.placeId && card.placeId && target.placeId === card.placeId) return true;
+
+    // Same hex-pair
+    if (target.hexId && card.hexId && target.hexId === card.hexId) return true;
+
+    // Same CID (numeric)
+    if (target.cid && card.cid && target.cid === card.cid) return true;
+
+    // Cross-format: target CID vs card hex-pair second part
+    if (target.cid && card.hexId) {
+        try {
+            const cidFromHex = BigInt(card.hexId.split(':')[1]).toString();
+            if (cidFromHex === target.cid) return true;
+        } catch { /* malformed */ }
+    }
+
+    // Cross-format: card CID vs target hex-pair second part
+    if (card.cid && target.hexId) {
+        try {
+            const cidFromHex = BigInt(target.hexId.split(':')[1]).toString();
+            if (cidFromHex === card.cid) return true;
+        } catch { /* malformed */ }
+    }
+
+    return false;
+}
+
+/**
+ * Normalise any raw ID input from the user into a GmbIds object.
+ * Accepts: ChIJ string, hex-pair string, numeric CID string, or full Maps URL.
+ *
+ * @param {object} raw
+ * @param {string} [raw.googleMapsUrl]
+ * @param {string} [raw.placeId]
+ * @param {string} [raw.cid]
+ * @param {string} [raw.hexId]
+ * @returns {GmbIds}
+ */
+export function normaliseTargetIds({ googleMapsUrl, placeId, cid, hexId }) {
+    // Start from URL if provided — extracts all formats at once
+    const fromUrl = googleMapsUrl ? extractAllIdsFromUrl(googleMapsUrl) : {};
+
+    const result = {
+        placeId: placeId || fromUrl.placeId || null,
+        hexId:   hexId   || fromUrl.hexId   || null,
+        cid:     cid     || fromUrl.cid     || null,
+    };
+
+    // If only hexId given, derive CID from it
+    if (result.hexId && !result.cid) {
+        try {
+            result.cid = BigInt(result.hexId.split(':')[1]).toString();
+        } catch { /* malformed */ }
+    }
+
+    // If only placeId given (ChIJ), nothing more to derive — that's fine
+    return result;
 }

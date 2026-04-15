@@ -4,58 +4,65 @@
   "schemaVersion": 1,
   "properties": {
     "keyword": {
-      "title": "Target Keyword",
+      "title": "Target Keyword *",
       "type": "string",
-      "description": "The search keyword to rank check. E.g. 'Dental clinic', 'dentist near me'.",
+      "description": "The Google Maps search keyword to rank-check at every grid point. E.g. 'Dental clinic', 'dentist near me'.",
       "editor": "textfield",
       "example": "Dental clinic"
     },
     "googleMapsUrl": {
-      "title": "Google Maps URL (easiest — paste from GMB profile)",
+      "title": "Google Maps URL (easiest — paste from the GMB listing)",
       "type": "string",
-      "description": "Paste the full Google Maps URL of the business. The Place ID is extracted automatically from the URL — no manual lookup needed. E.g. https://www.google.com/maps/place/Business+Name/@lat,lng,17z/data=...",
+      "description": "Paste the full Google Maps URL of the business. All unique IDs (Place ID, CID, hex-pair) are extracted automatically. This is the recommended input — no manual ID lookup needed.",
       "editor": "textfield",
-      "example": "https://www.google.com/maps/place/Abhijit+MultiSpeciality+Dental+Hospital/@17.9784,79.5965,17z"
+      "example": "https://www.google.com/maps/place/Abhijit+MultiSpeciality+Dental+Hospital/@17.9784,79.5965,17z/data=!3m1!4b1!4s0x3bcb93b35bbe5f61:0x5e8f1e0d4c3a2b1f"
     },
     "placeId": {
-      "title": "Place ID (alternative to Google Maps URL)",
+      "title": "Place ID (ChIJ... format)",
       "type": "string",
-      "description": "Google Place ID of the target business (ChIJ... or hex-pair format). Use this if you already have the Place ID. Otherwise just paste the Google Maps URL above.",
+      "description": "Google Place ID in base64url format. Starts with 'ChIJ'. Found in the Google Maps URL path or via the Places API. Provide this OR googleMapsUrl.",
       "editor": "textfield",
       "example": "ChIJN1t_tDeuEmsRUsoyG83frY4"
     },
-    "businessName": {
-      "title": "Business Name (last resort fallback)",
+    "cid": {
+      "title": "CID (numeric Customer ID)",
       "type": "string",
-      "description": "Only needed if neither googleMapsUrl nor placeId is provided. The actor will search Google Maps to resolve the Place ID from this name.",
+      "description": "Google's numeric CID for the business. Found in the ?cid= query param of some Maps URLs, or as the decimal of the second hex value in a hex-pair. E.g. '17559876543210'.",
       "editor": "textfield",
-      "example": "A.V Dental and Health Care"
+      "example": "17559876543210"
+    },
+    "hexId": {
+      "title": "Hex-pair ID (0x...:0x... format)",
+      "type": "string",
+      "description": "The hex-pair identifier embedded in the Maps URL data param (e.g. after !1s). Format: '0x3bcb93b3...:0x5e8f1e0d...'. The second part is the CID in hex.",
+      "editor": "textfield",
+      "example": "0x3bcb93b35bbe5f61:0x5e8f1e0d4c3a2b1f"
     },
     "centerLat": {
-      "title": "Center Latitude",
+      "title": "Center Latitude *",
       "type": "number",
-      "description": "Latitude of the grid center (business location). E.g. 17.3850 for Hyderabad.",
-      "example": 17.3850
+      "description": "Latitude of the grid center — the business's coordinates. Copy from Google Maps by right-clicking the pin.",
+      "example": 17.9784
     },
     "centerLng": {
-      "title": "Center Longitude",
+      "title": "Center Longitude *",
       "type": "number",
-      "description": "Longitude of the grid center (business location). E.g. 78.4867 for Hyderabad.",
-      "example": 78.4867
+      "description": "Longitude of the grid center. Copy from Google Maps by right-clicking the pin.",
+      "example": 79.5965
     },
     "gridSize": {
-      "title": "Grid Size (3, 5, 7, or 9)",
+      "title": "Grid Size (3 / 5 / 7 / 9)",
       "type": "integer",
-      "description": "Creates an N×N grid of rank-check points. Enter 3 (9 pts hyper-local), 5 (25 pts neighbourhood), 7 (49 pts standard), or 9 (81 pts metro-wide).",
+      "description": "N for an N×N grid. Enter 3 (9 pts, hyper-local), 5 (25 pts, neighbourhood), 7 (49 pts, standard), or 9 (81 pts, metro-wide).",
       "editor": "number",
       "minimum": 3,
       "maximum": 9,
       "default": 7
     },
     "gridSpacingMeters": {
-      "title": "Grid Spacing in meters",
+      "title": "Grid Spacing in meters (300 / 500 / 1000 / 2000)",
       "type": "integer",
-      "description": "Distance between adjacent grid points in metres. Enter 300 (dense city), 500 (standard/optimal), 1000 (suburb), or 2000 (rural).",
+      "description": "Distance between adjacent grid points. Enter 300 (dense city), 500 (standard/optimal), 1000 (suburb), or 2000 (rural).",
       "editor": "number",
       "minimum": 100,
       "maximum": 5000,
@@ -64,7 +71,8 @@
     "maxRankToShow": {
       "title": "Max Rank to Track",
       "type": "integer",
-      "description": "If the business is ranked beyond this position at a grid point, record it as 'not ranked'. Default 20.",
+      "description": "If the business ranks beyond this position at a grid point, it is recorded as INVISIBLE (rank 8+ zone). Default 20.",
+      "editor": "number",
       "default": 20,
       "minimum": 5,
       "maximum": 50
@@ -72,14 +80,14 @@
     "language": {
       "title": "Language",
       "type": "string",
-      "description": "Google Maps interface language (hl parameter).",
+      "description": "Google Maps interface language (hl param). Default 'en'.",
       "editor": "textfield",
       "default": "en"
     },
     "proxyConfiguration": {
       "title": "Proxy Configuration",
       "type": "object",
-      "description": "Residential proxies are mandatory — Google blocks datacenter IPs.",
+      "description": "Residential proxies are mandatory — Google blocks datacenter IPs on Maps searches.",
       "editor": "proxy",
       "default": {
         "useApifyProxy": true,

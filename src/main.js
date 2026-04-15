@@ -2,20 +2,22 @@
  * main.js — Geo-Grid Rank Scanner
  *
  * Apify actor entry point. Orchestrates:
- *  1. Input validation
- *  2. Target business Place ID resolution (if name provided instead of ID)
+ *  1. Input validation — requires at least one hard unique ID
+ *  2. Normalise target IDs (googleMapsUrl | placeId | cid | hexId)
  *  3. Grid point generation
- *  4. Parallel rank scraping at each grid point (concurrency 3)
- *  5. Summary computation (quadrant averages, weakest quadrant)
+ *  4. Parallel rank scraping at each grid point (10 concurrent tabs)
+ *  5. Summary computation (visibility score, quadrant averages)
  *  6. Dataset output
+ *
+ * No name-based resolution. All matching uses Google-native unique IDs only:
+ *   ChIJ Place ID, hex-pair, or CID (numeric).
  */
 
 import { Actor, log } from 'apify';
 import { PlaywrightCrawler, sleep } from 'crawlee';
-import { generateGridPoints } from './generateGrid.js';
-import { resolveTargetPlaceId } from './resolveTarget.js';
-import { checkRankAtPoint } from './scrapeRank.js';
-import { extractPlaceIdFromUrl } from './extractPlaceId.js';
+import { generateGridPoints }   from './generateGrid.js';
+import { checkRankAtPoint }     from './scrapeRank.js';
+import { normaliseTargetIds }   from './extractPlaceId.js';
 
 await Actor.init();
 
@@ -26,50 +28,54 @@ const input = await Actor.getInput();
 const {
     keyword,
     googleMapsUrl,
-    placeId: inputPlaceId,
-    businessName,
+    placeId,
+    cid,
+    hexId,
     centerLat,
     centerLng,
-    gridSize            = 7,
-    gridSpacingMeters   = 500,
-    maxRankToShow       = 20,
-    language            = 'en',
-    proxyConfiguration  = { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] },
+    gridSize           = 7,
+    gridSpacingMeters  = 500,
+    maxRankToShow      = 20,
+    language           = 'en',
+    proxyConfiguration = { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] },
 } = input;
 
-// Validate required inputs
-if (!keyword)   throw new Error('Input "keyword" is required (e.g. "Dental clinic")');
-if (!centerLat) throw new Error('Input "centerLat" is required');
-if (!centerLng) throw new Error('Input "centerLng" is required');
-if (!googleMapsUrl && !inputPlaceId && !businessName) {
-    throw new Error('Provide one of: "googleMapsUrl", "placeId", or "businessName" to identify the target business.');
+// ─── Validate ─────────────────────────────────────────────────────────────────
+
+if (!keyword)   throw new Error('"keyword" is required (e.g. "Dental clinic")');
+if (!centerLat) throw new Error('"centerLat" is required');
+if (!centerLng) throw new Error('"centerLng" is required');
+if (!googleMapsUrl && !placeId && !cid && !hexId) {
+    throw new Error(
+        'Provide at least one unique identifier for the target business:\n' +
+        '  • googleMapsUrl — paste the full Google Maps URL (easiest)\n' +
+        '  • placeId       — ChIJ... Place ID\n' +
+        '  • cid           — numeric Customer ID\n' +
+        '  • hexId         — hex-pair (0x...:0x...)'
+    );
 }
 
-// ─── Resolve Place ID from Google Maps URL (fastest, most reliable) ───────────
-// Priority: googleMapsUrl → placeId → businessName (resolved at crawl time)
+// ─── Normalise target IDs ─────────────────────────────────────────────────────
+// Derives all available ID formats from whatever the user provided.
+// Cross-format bridge: CID = decimal of hex-pair second part, so
+// providing any one format lets us match against any other format in results.
 
-let resolvedPlaceId = inputPlaceId || null;
-let resolvedName    = businessName || null;
+const targetIds = normaliseTargetIds({ googleMapsUrl, placeId, cid, hexId });
 
-if (googleMapsUrl && !resolvedPlaceId) {
-    resolvedPlaceId = extractPlaceIdFromUrl(googleMapsUrl);
-    if (resolvedPlaceId) {
-        log.info(`Extracted Place ID from URL: ${resolvedPlaceId}`);
-        // Also extract business name from URL path for logging/output
-        const nameMatch = googleMapsUrl.match(/maps\/place\/([^/@]+)/);
-        if (nameMatch) resolvedName = decodeURIComponent(nameMatch[1].replace(/\+/g, ' '));
-    } else {
-        log.warning('Could not extract Place ID from googleMapsUrl — will fall back to businessName resolution.');
-    }
+// Extract a display name from the Maps URL path for logging/output (cosmetic only)
+let displayName = null;
+if (googleMapsUrl) {
+    const m = googleMapsUrl.match(/maps\/place\/([^/@]+)/);
+    if (m) displayName = decodeURIComponent(m[1].replace(/\+/g, ' '));
 }
 
 log.info('=== Geo-Grid Rank Scanner ===');
-log.info(`Keyword: "${keyword}"`);
-log.info(`Center: ${centerLat}, ${centerLng}`);
-log.info(`Grid: ${gridSize}×${gridSize} = ${gridSize * gridSize} points @ ${gridSpacingMeters}m spacing`);
-log.info(`Target Place ID: ${resolvedPlaceId || '(resolving from business name)'}`);
+log.info(`Keyword:   "${keyword}"`);
+log.info(`Center:    ${centerLat}, ${centerLng}`);
+log.info(`Grid:      ${gridSize}×${gridSize} = ${gridSize * gridSize} points @ ${gridSpacingMeters}m`);
+log.info(`Target IDs: placeId=${targetIds.placeId || '-'} | cid=${targetIds.cid || '-'} | hexId=${targetIds.hexId || '-'}`);
 
-// ─── Proxy setup ──────────────────────────────────────────────────────────────
+// ─── Proxy ────────────────────────────────────────────────────────────────────
 
 const proxy = await Actor.createProxyConfiguration(proxyConfiguration);
 
@@ -84,42 +90,22 @@ const gridPoints = generateGridPoints({
 
 log.info(`Generated ${gridPoints.length} grid points.`);
 
-// ─── State shared across crawler requests ─────────────────────────────────────
-
-// resolvedPlaceId / resolvedName are already set above if googleMapsUrl or placeId was given.
-// placeIdResolved = true means we don't need a RESOLVE_TARGET request.
-let placeIdResolved = !!resolvedPlaceId;
-
-// gridResults[pointIndex] will be populated by crawler handlers
+// gridResults[pointIndex] populated by crawler handlers
 const gridResults = new Array(gridPoints.length).fill(null);
 
 // ─── Build request queue ──────────────────────────────────────────────────────
 
-// If we still don't have a Place ID, add a resolution request first (FIFO — runs before grid points).
-const requests = [];
-
-if (!placeIdResolved) {
-    if (!businessName) throw new Error('No googleMapsUrl, placeId, or businessName provided — cannot identify target business.');
-    requests.push({
-        url: `https://www.google.com/maps/search/${encodeURIComponent(businessName)}/?hl=${language}`,
-        label: 'RESOLVE_TARGET',
-        userData: { businessName, language },
-    });
-}
-
-for (const pt of gridPoints) {
-    requests.push({
-        url: `https://www.google.com/maps/search/${encodeURIComponent(keyword)}/@${pt.lat},${pt.lng},14z?hl=${language}`,
-        label: 'GRID_POINT',
-        userData: { point: pt, keyword, language },
-    });
-}
+const requests = gridPoints.map((pt) => ({
+    url: `https://www.google.com/maps/search/${encodeURIComponent(keyword)}/@${pt.lat},${pt.lng},14z?hl=${language}`,
+    label: 'GRID_POINT',
+    userData: { point: pt, keyword, language },
+}));
 
 // ─── Crawler ──────────────────────────────────────────────────────────────────
 
 const crawler = new PlaywrightCrawler({
     proxyConfiguration: proxy,
-    maxConcurrency: 10,          // 32 GB RAM → run 10 browser tabs in parallel
+    maxConcurrency: 10,
     requestHandlerTimeoutSecs: 90,
 
     launchContext: {
@@ -134,7 +120,6 @@ const crawler = new PlaywrightCrawler({
         },
     },
 
-    // Anti-bot: mask automation fingerprint
     preNavigationHooks: [
         async ({ page }) => {
             await page.addInitScript(() => {
@@ -145,104 +130,60 @@ const crawler = new PlaywrightCrawler({
     ],
 
     requestHandler: async ({ request, page, log: crawlerLog }) => {
-        const { label, userData } = request;
+        const { point } = request.userData;
 
-        if (label === 'RESOLVE_TARGET') {
-            crawlerLog.info(`Resolving Place ID for "${userData.businessName}"…`);
-            const result = await resolveTargetPlaceId({
-                page,
-                businessName: userData.businessName,
-                language: userData.language,
-            });
+        crawlerLog.info(
+            `[${point.pointIndex + 1}/${gridPoints.length}] ` +
+            `(${point.lat}, ${point.lng}) — ${point.quadrant}`
+        );
 
-            if (result.placeId) {
-                resolvedPlaceId = result.placeId;
-                resolvedName    = result.resolvedName || userData.businessName;
-                placeIdResolved = true;
-                crawlerLog.info(`Resolved Place ID: ${resolvedPlaceId} → "${resolvedName}"`);
-            } else {
-                crawlerLog.warning(
-                    `Could not resolve Place ID for "${userData.businessName}". ` +
-                    'Will use name-based fallback matching for all grid points.'
-                );
-            }
+        await sleep(Math.random() * 400); // small jitter
 
-            return; // No dataset push for resolution step
-        }
+        const result = await checkRankAtPoint({
+            page,
+            keyword: request.userData.keyword,
+            lat:     point.lat,
+            lng:     point.lng,
+            targetIds,
+            maxRankToShow,
+            language: request.userData.language,
+        });
 
-        if (label === 'GRID_POINT') {
-            const { point } = userData;
+        gridResults[point.pointIndex] = {
+            pointIndex: point.pointIndex,
+            row:        point.row,
+            col:        point.col,
+            lat:        point.lat,
+            lng:        point.lng,
+            quadrant:   point.quadrant,
+            rank:       result.rank,
+            ranked:     result.ranked,
+            ...(result.error ? { error: result.error } : {}),
+        };
 
-            // If place_id resolution failed, we still proceed with name matching
-            if (!resolvedPlaceId && !resolvedName) {
-                crawlerLog.warning(`No target identifier — skipping point ${point.pointIndex}`);
-                gridResults[point.pointIndex] = { ...point, rank: null, ranked: false, error: 'no_target_id' };
-                return;
-            }
-
-            crawlerLog.info(
-                `[${point.pointIndex + 1}/${gridPoints.length}] ` +
-                `Checking rank at (${point.lat}, ${point.lng}) — ${point.quadrant}`
-            );
-
-            await sleep(Math.random() * 500); // small jitter to avoid burst
-
-            const result = await checkRankAtPoint({
-                page,
-                keyword: userData.keyword,
-                lat: point.lat,
-                lng: point.lng,
-                targetPlaceId: resolvedPlaceId || '',
-                targetName: resolvedName || '',
-                maxRankToShow,
-                language: userData.language,
-            });
-
-            gridResults[point.pointIndex] = {
-                pointIndex: point.pointIndex,
-                row:        point.row,
-                col:        point.col,
-                lat:        point.lat,
-                lng:        point.lng,
-                quadrant:   point.quadrant,
-                rank:       result.rank,
-                ranked:     result.ranked,
-                ...(result.error ? { error: result.error } : {}),
-            };
-
-            if (result.ranked) {
-                crawlerLog.info(`  → Rank #${result.rank} in ${point.quadrant}`);
-            } else {
-                crawlerLog.info(`  → Not ranked in top ${maxRankToShow}`);
-            }
-        }
+        crawlerLog.info(result.ranked
+            ? `  → Rank #${result.rank}`
+            : `  → Not in top ${maxRankToShow}`
+        );
     },
 
     failedRequestHandler: async ({ request, log: crawlerLog }) => {
-        crawlerLog.error(`Request failed: ${request.url}`);
-        if (request.userData.point) {
-            const { point } = request.userData;
-            gridResults[point.pointIndex] = {
-                ...point,
-                rank: null,
-                ranked: false,
-                error: 'request_failed',
-            };
-        }
+        crawlerLog.error(`Failed: ${request.url}`);
+        const { point } = request.userData;
+        gridResults[point.pointIndex] = {
+            pointIndex: point.pointIndex,
+            row: point.row, col: point.col,
+            lat: point.lat, lng: point.lng,
+            quadrant: point.quadrant,
+            rank: null, ranked: false, error: 'request_failed',
+        };
     },
 });
 
-// For RESOLVE_TARGET to run before GRID_POINT requests, we add them in order.
-// Crawlee processes requests in FIFO order by default.
 await crawler.addRequests(requests);
 await crawler.run();
 
-// ─── Summary computation ──────────────────────────────────────────────────────
-
-// Rank tier thresholds (matches the PDF report colour bands)
-const TIER_VISIBLE   = { min: 1,  max: 3  };   // green
-const TIER_WEAK      = { min: 4,  max: 7  };   // yellow
-// rank 8+ or null → INVISIBLE (red)
+// ─── Summary ──────────────────────────────────────────────────────────────────
 
 function getRankCategory(rank) {
     if (!rank || rank > 7) return 'INVISIBLE';
@@ -250,42 +191,33 @@ function getRankCategory(rank) {
     return 'WEAK';
 }
 
-// Center point index (the business location itself)
 const centerIndex = Math.floor(gridSize / 2) * gridSize + Math.floor(gridSize / 2);
 
-// Annotate each result with category + isCenter flag
 const annotatedResults = gridResults.map((pt, i) => {
     if (!pt) return null;
     return {
         ...pt,
-        category: getRankCategory(pt.rank),
-        isCenter: i === centerIndex,
+        category:    getRankCategory(pt.rank),
+        isCenter:    i === centerIndex,
         displayRank: pt.rank && pt.rank <= 7 ? String(pt.rank) : '8+',
     };
 }).filter(Boolean);
 
-// Counts
 const visibleCount   = annotatedResults.filter((p) => p.category === 'VISIBLE').length;
 const weakCount      = annotatedResults.filter((p) => p.category === 'WEAK').length;
 const invisibleCount = annotatedResults.filter((p) => p.category === 'INVISIBLE' && !p.isCenter).length;
 const totalPoints    = annotatedResults.length;
-
-// Visibility score = (visible + weak) / total × 100  (matches PDF formula)
 const visibilityScore = +(((visibleCount + weakCount) / totalPoints) * 100).toFixed(1);
 
-// Average rank helpers
 function avg(arr) {
     if (!arr.length) return null;
     return +(arr.reduce((s, v) => s + v, 0) / arr.length).toFixed(2);
 }
 
-// Quadrant averages (NW/NE/SW/SE — same as GMB Master Pro app storage)
-// Use rank 20 for invisible points so average reflects true weakness
 const quadrantRanks = { NW: [], NE: [], SW: [], SE: [] };
 for (const pt of annotatedResults) {
     if (pt.isCenter) continue;
-    const effectiveRank = pt.rank ?? 20;
-    quadrantRanks[pt.quadrant].push(effectiveRank);
+    quadrantRanks[pt.quadrant].push(pt.rank ?? 20);
 }
 
 const quadrantAvg = {
@@ -295,80 +227,59 @@ const quadrantAvg = {
     SE: avg(quadrantRanks.SE),
 };
 
-const validQuadrants = Object.entries(quadrantAvg).filter(([, v]) => v !== null);
-const weakestQuadrant = validQuadrants.length
-    ? validQuadrants.sort((a, b) => b[1] - a[1])[0][0]
-    : null;
+const weakestQuadrant = Object.entries(quadrantAvg)
+    .filter(([, v]) => v !== null)
+    .sort((a, b) => b[1] - a[1])[0]?.[0] || null;
 
-// All ranked positions (excluding center)
 const allRanks = annotatedResults
     .filter((p) => !p.isCenter && p.rank != null)
     .map((p) => p.rank);
 
-// 2-D grid matrix for easy heatmap rendering (row-major order)
-// Each cell: { row, col, rank, category, displayRank, isCenter }
-const gridMatrix = [];
-for (let r = 0; r < gridSize; r++) {
-    const row = [];
-    for (let c = 0; c < gridSize; c++) {
+// 2-D grid matrix for heatmap rendering
+const gridMatrix = Array.from({ length: gridSize }, (_, r) =>
+    Array.from({ length: gridSize }, (_, c) => {
         const pt = annotatedResults.find((p) => p.row === r && p.col === c);
-        row.push(pt
+        return pt
             ? { row: r, col: c, rank: pt.rank, category: pt.category, displayRank: pt.displayRank, isCenter: pt.isCenter }
-            : { row: r, col: c, rank: null, category: 'INVISIBLE', displayRank: '8+', isCenter: false }
-        );
-    }
-    gridMatrix.push(row);
-}
+            : { row: r, col: c, rank: null, category: 'INVISIBLE', displayRank: '8+', isCenter: false };
+    })
+);
 
 const summary = {
-    // Visibility score (headline metric, matches PDF)
-    visibilityScore,         // e.g. 12.2  (%)
-    visibilityScoreLabel:    `${Math.round(visibilityScore)}%`,
-
-    // Point counts by tier
+    visibilityScore,
+    visibilityScoreLabel: `${Math.round(visibilityScore)}%`,
     totalPoints,
-    visibleCount,            // rank 1–3 (green)
-    weakCount,               // rank 4–7 (yellow)
-    invisibleCount,          // rank 8+  (red, excludes center)
-
-    // Rank stats
-    avgRank:          avg(allRanks),
-    minRank:          allRanks.length ? Math.min(...allRanks) : null,
-    maxRank:          allRanks.length ? Math.max(...allRanks) : null,
-    top3Count:        allRanks.filter((r) => r <= 3).length,
-
-    // Quadrant breakdown
+    visibleCount,
+    weakCount,
+    invisibleCount,
+    avgRank:        avg(allRanks),
+    minRank:        allRanks.length ? Math.min(...allRanks) : null,
+    maxRank:        allRanks.length ? Math.max(...allRanks) : null,
+    top3Count:      allRanks.filter((r) => r <= 3).length,
     quadrantAvg,
     weakestQuadrant,
 };
 
-// ─── Dataset output ───────────────────────────────────────────────────────────
+// ─── Output ───────────────────────────────────────────────────────────────────
 
-const output = {
+await Actor.pushData({
     keyword,
-    businessName:       resolvedName || businessName || null,
-    placeId:            resolvedPlaceId || null,
+    businessName:   displayName,
+    targetIds,           // all resolved ID formats for reference
     centerLat,
     centerLng,
     gridSize,
     gridSpacingMeters,
     maxRankToShow,
-    scanDate:           new Date().toISOString().split('T')[0],
-    scanTimestamp:      new Date().toISOString(),
-
-    // Flat list of all grid point results
-    gridResults:        annotatedResults,
-
-    // 2-D matrix [row][col] — ready for heatmap rendering / PDF generation
+    scanDate:       new Date().toISOString().split('T')[0],
+    scanTimestamp:  new Date().toISOString(),
+    gridResults:    annotatedResults,
     gridMatrix,
-
     summary,
-};
-
-await Actor.pushData(output);
+});
 
 log.info('=== Scan Complete ===');
-log.info(`Visibility score: ${summary.visibilityScoreLabel} | Visible: ${visibleCount} | Weak: ${weakCount} | Invisible: ${invisibleCount}`);
-log.info(`Avg rank: ${summary.avgRank} | Top-3 count: ${summary.top3Count} | Weakest quadrant: ${summary.weakestQuadrant}`);
+log.info(`Visibility: ${summary.visibilityScoreLabel} | Visible: ${visibleCount} | Weak: ${weakCount} | Invisible: ${invisibleCount}`);
+log.info(`Avg rank: ${summary.avgRank} | Weakest quadrant: ${weakestQuadrant}`);
 
 await Actor.exit();
