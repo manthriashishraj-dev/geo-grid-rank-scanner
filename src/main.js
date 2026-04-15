@@ -269,6 +269,11 @@ const summary = {
 
 // ─── Output ───────────────────────────────────────────────────────────────────
 
+// Collect _debug fields from gridResults to top-level for inspection
+const _debugCards = annotatedResults
+    .filter(pt => pt._debug)
+    .map(pt => ({ pointIndex: pt.pointIndex, lat: pt.lat, lng: pt.lng, _debug: pt._debug }));
+
 await Actor.pushData({
     keyword,
     businessName:   displayName,
@@ -283,6 +288,7 @@ await Actor.pushData({
     gridResults:    annotatedResults,
     gridMatrix,
     summary,
+    _debugCards,    // raw card DOM data for first few points (debug mode only)
 });
 
 log.info('=== Scan Complete ===');
