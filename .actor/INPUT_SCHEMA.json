@@ -10,17 +10,24 @@
       "editor": "textfield",
       "example": "Dental clinic"
     },
-    "placeId": {
-      "title": "Place ID (recommended)",
+    "googleMapsUrl": {
+      "title": "Google Maps URL (easiest — paste from GMB profile)",
       "type": "string",
-      "description": "Google Place ID of the target business (ChIJ... or hex-pair format). Provide this OR businessName. Place ID is more accurate.",
+      "description": "Paste the full Google Maps URL of the business. The Place ID is extracted automatically from the URL — no manual lookup needed. E.g. https://www.google.com/maps/place/Business+Name/@lat,lng,17z/data=...",
+      "editor": "textfield",
+      "example": "https://www.google.com/maps/place/Abhijit+MultiSpeciality+Dental+Hospital/@17.9784,79.5965,17z"
+    },
+    "placeId": {
+      "title": "Place ID (alternative to Google Maps URL)",
+      "type": "string",
+      "description": "Google Place ID of the target business (ChIJ... or hex-pair format). Use this if you already have the Place ID. Otherwise just paste the Google Maps URL above.",
       "editor": "textfield",
       "example": "ChIJN1t_tDeuEmsRUsoyG83frY4"
     },
     "businessName": {
-      "title": "Business Name (if no Place ID)",
+      "title": "Business Name (last resort fallback)",
       "type": "string",
-      "description": "Full business name. If placeId is not provided, the actor will auto-resolve it from this name on the first run.",
+      "description": "Only needed if neither googleMapsUrl nor placeId is provided. The actor will search Google Maps to resolve the Place ID from this name.",
       "editor": "textfield",
       "example": "A.V Dental and Health Care"
     },

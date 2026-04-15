@@ -15,6 +15,7 @@ import { PlaywrightCrawler, sleep } from 'crawlee';
 import { generateGridPoints } from './generateGrid.js';
 import { resolveTargetPlaceId } from './resolveTarget.js';
 import { checkRankAtPoint } from './scrapeRank.js';
+import { extractPlaceIdFromUrl } from './extractPlaceId.js';
 
 await Actor.init();
 
@@ -24,6 +25,7 @@ const input = await Actor.getInput();
 
 const {
     keyword,
+    googleMapsUrl,
     placeId: inputPlaceId,
     businessName,
     centerLat,
@@ -39,15 +41,33 @@ const {
 if (!keyword)   throw new Error('Input "keyword" is required (e.g. "Dental clinic")');
 if (!centerLat) throw new Error('Input "centerLat" is required');
 if (!centerLng) throw new Error('Input "centerLng" is required');
-if (!inputPlaceId && !businessName) {
-    throw new Error('Provide either "placeId" or "businessName" so the actor knows which business to track.');
+if (!googleMapsUrl && !inputPlaceId && !businessName) {
+    throw new Error('Provide one of: "googleMapsUrl", "placeId", or "businessName" to identify the target business.');
+}
+
+// ─── Resolve Place ID from Google Maps URL (fastest, most reliable) ───────────
+// Priority: googleMapsUrl → placeId → businessName (resolved at crawl time)
+
+let resolvedPlaceId = inputPlaceId || null;
+let resolvedName    = businessName || null;
+
+if (googleMapsUrl && !resolvedPlaceId) {
+    resolvedPlaceId = extractPlaceIdFromUrl(googleMapsUrl);
+    if (resolvedPlaceId) {
+        log.info(`Extracted Place ID from URL: ${resolvedPlaceId}`);
+        // Also extract business name from URL path for logging/output
+        const nameMatch = googleMapsUrl.match(/maps\/place\/([^/@]+)/);
+        if (nameMatch) resolvedName = decodeURIComponent(nameMatch[1].replace(/\+/g, ' '));
+    } else {
+        log.warning('Could not extract Place ID from googleMapsUrl — will fall back to businessName resolution.');
+    }
 }
 
 log.info('=== Geo-Grid Rank Scanner ===');
 log.info(`Keyword: "${keyword}"`);
 log.info(`Center: ${centerLat}, ${centerLng}`);
 log.info(`Grid: ${gridSize}×${gridSize} = ${gridSize * gridSize} points @ ${gridSpacingMeters}m spacing`);
-log.info(`Target: ${inputPlaceId || businessName}`);
+log.info(`Target Place ID: ${resolvedPlaceId || '(resolving from business name)'}`);
 
 // ─── Proxy setup ──────────────────────────────────────────────────────────────
 
@@ -66,21 +86,20 @@ log.info(`Generated ${gridPoints.length} grid points.`);
 
 // ─── State shared across crawler requests ─────────────────────────────────────
 
-let resolvedPlaceId = inputPlaceId || null;
-let resolvedName    = businessName || null;
-let placeIdResolved = !!inputPlaceId; // true if we already have it from input
+// resolvedPlaceId / resolvedName are already set above if googleMapsUrl or placeId was given.
+// placeIdResolved = true means we don't need a RESOLVE_TARGET request.
+let placeIdResolved = !!resolvedPlaceId;
 
 // gridResults[pointIndex] will be populated by crawler handlers
 const gridResults = new Array(gridPoints.length).fill(null);
 
 // ─── Build request queue ──────────────────────────────────────────────────────
 
-// First request: resolve place_id if not supplied
-// Then: one request per grid point
-
+// If we still don't have a Place ID, add a resolution request first (FIFO — runs before grid points).
 const requests = [];
 
 if (!placeIdResolved) {
+    if (!businessName) throw new Error('No googleMapsUrl, placeId, or businessName provided — cannot identify target business.');
     requests.push({
         url: `https://www.google.com/maps/search/${encodeURIComponent(businessName)}/?hl=${language}`,
         label: 'RESOLVE_TARGET',
@@ -100,8 +119,8 @@ for (const pt of gridPoints) {
 
 const crawler = new PlaywrightCrawler({
     proxyConfiguration: proxy,
-    maxConcurrency: 3,
-    requestHandlerTimeoutSecs: 60,
+    maxConcurrency: 10,          // 32 GB RAM → run 10 browser tabs in parallel
+    requestHandlerTimeoutSecs: 90,
 
     launchContext: {
         launchOptions: {
