@@ -5,8 +5,8 @@
  * the rank position of the target business using hard unique IDs only.
  *
  * Matching priority (no name fallback):
- *  1. data-cid attribute on any card element (most reliable)
- *  2. CID derived from hex-pair in card href (!1s0x...:0x... data blob)
+ *  1. data-cid attribute on any card element  (most reliable)
+ *  2. CID derived from hex-pair in card href  (!1s0x...:0x... data blob)
  *  3. Same hex-pair exact match
  *  4. Same ChIJ PlaceId match
  */
@@ -19,10 +19,6 @@ const SCROLL_PAUSE_MS   = 1400;
 const CARD_WAIT_MS      = 6000;
 const MAX_SCROLL_ROUNDS = 10;
 
-// Save a full DOM diagnostic for the very first grid point so we can
-// inspect exactly what Google serves. Guarded by a flag so it fires once.
-let _diagSaved = false;
-
 // ─── URL ID extractor (Node.js side) ─────────────────────────────────────────
 
 function extractIdsFromUrl(url) {
@@ -32,6 +28,7 @@ function extractIdsFromUrl(url) {
     let hexId   = null;
     let cid     = null;
 
+    // 1. Hex-pair: !1s0x...:0x...
     const hexMatch = url.match(/!1s(0x[a-f0-9]+:0x[a-f0-9]+)/i);
     if (hexMatch) {
         hexId = hexMatch[1].toLowerCase();
@@ -41,6 +38,7 @@ function extractIdsFromUrl(url) {
         }
     }
 
+    // 2. ChIJ Place ID
     const chijPath = url.match(/maps\/place\/[^/]*\/(ChIJ[A-Za-z0-9_-]{10,})/);
     if (chijPath) {
         placeId = chijPath[1];
@@ -49,6 +47,7 @@ function extractIdsFromUrl(url) {
         if (chijRaw) placeId = chijRaw[1];
     }
 
+    // 3. ?cid= numeric
     const cidParam = url.match(/[?&]cid=(\d+)/);
     if (cidParam) cid = cidParam[1];
 
@@ -57,6 +56,18 @@ function extractIdsFromUrl(url) {
 
 // ─── Main export ──────────────────────────────────────────────────────────────
 
+/**
+ * @param {object}  params
+ * @param {import('playwright').Page} params.page
+ * @param {string}  params.keyword
+ * @param {number}  params.lat
+ * @param {number}  params.lng
+ * @param {import('./extractPlaceId.js').GmbIds} params.targetIds
+ * @param {number}  [params.maxRankToShow]
+ * @param {string}  [params.language]
+ * @param {boolean} [params.captureDebug]  — if true, return raw card data for inspection
+ * @returns {Promise<{rank,ranked,error?,_debug?}>}
+ */
 export async function checkRankAtPoint({
     page,
     keyword,
@@ -65,63 +76,64 @@ export async function checkRankAtPoint({
     targetIds,
     maxRankToShow = 20,
     language      = 'en',
+    captureDebug  = false,
 }) {
     const url = buildGridPointUrl(keyword, lat, lng, language);
-    process.stdout.write(`SCRAPE_START lat=${lat} lng=${lng}\n`);
 
+    // ── Navigate ──────────────────────────────────────────────────────────────
     try {
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     } catch (err) {
         return { rank: null, ranked: false, error: `nav_timeout: ${err.message}` };
     }
 
-    // Wait for result feed
+    // ── Wait for result feed ──────────────────────────────────────────────────
     try {
         await page.waitForSelector('[role="feed"]', { timeout: CARD_WAIT_MS });
     } catch {
         const hasDataCid = await page.$('[data-cid]');
         if (!hasDataCid) {
+            // Capture DOM for debugging if requested
+            if (captureDebug) {
+                const pageUrl  = await page.evaluate(() => window.location.href);
+                const bodySnip = await page.evaluate(() => document.body.innerText.slice(0, 500));
+                return { rank: null, ranked: false, error: 'no_feed', _debug: { pageUrl, bodySnip } };
+            }
             return { rank: null, ranked: false, error: 'no_feed' };
         }
     }
 
     await sleep(800);
 
-    // ── Diagnostic: log DOM state for first point to actor logs ─────────────
-    if (!_diagSaved) {
-        _diagSaved = true; // Set eagerly to avoid duplicate log spam
-        try {
-            const diagData = await page.evaluate(() => {
-                const feed = document.querySelector('[role="feed"]');
-                const feedChildren = feed ? Array.from(feed.children) : [];
-                const allCidEls = Array.from(document.querySelectorAll('[data-cid]'));
-                return {
-                    url: window.location.href,
-                    feedExists: !!feed,
-                    feedChildCount: feedChildren.length,
-                    // First 3 direct feed children — what do they look like?
-                    firstCards: feedChildren.slice(0, 3).map((card) => {
-                        const anchors = Array.from(card.querySelectorAll('a[href]'));
-                        return {
-                            tag: card.tagName,
-                            attrs: Array.from(card.attributes).map(a => `${a.name}="${a.value.slice(0,60)}"`),
-                            dataCid: card.getAttribute('data-cid') || card.querySelector('[data-cid]')?.getAttribute('data-cid') || null,
-                            hrefs: anchors.map(a => a.href).slice(0, 4),
-                            snippet: card.outerHTML.slice(0, 500),
-                        };
-                    }),
-                    allCids: allCidEls.map(el => el.getAttribute('data-cid')).slice(0, 10),
-                };
-            });
-            // Write directly to stdout — bypasses any log-level filtering
-            process.stdout.write('DIAG_START\n');
-            process.stdout.write(JSON.stringify(diagData, null, 2) + '\n');
-            process.stdout.write('DIAG_END\n');
-        } catch (e) {
-            process.stdout.write('DIAG_ERROR: ' + e.message + '\n');
-        }
+    // ── Capture DOM diagnostic snapshot if requested ──────────────────────────
+    let _debug = undefined;
+    if (captureDebug) {
+        _debug = await page.evaluate(() => {
+            const feed = document.querySelector('[role="feed"]');
+            const feedChildren = feed ? Array.from(feed.children) : [];
+            const allCidEls   = Array.from(document.querySelectorAll('[data-cid]'));
+            return {
+                pageUrl:        window.location.href,
+                feedExists:     !!feed,
+                feedChildCount: feedChildren.length,
+                feedHTML:       feed ? feed.outerHTML.slice(0, 3000) : null,
+                allCids:        allCidEls.map(el => el.getAttribute('data-cid')),
+                firstCards:     feedChildren.slice(0, 5).map((card) => {
+                    const anchors = Array.from(card.querySelectorAll('a[href]'));
+                    return {
+                        tag:     card.tagName,
+                        attrs:   Array.from(card.attributes).map(a => `${a.name}="${a.value.slice(0, 80)}"`),
+                        dataCid: card.getAttribute('data-cid') || card.querySelector('[data-cid]')?.getAttribute('data-cid') || null,
+                        hrefs:   anchors.map(a => a.href).slice(0, 5),
+                        jslog:   card.getAttribute('jslog') || null,
+                        snippet: card.outerHTML.slice(0, 800),
+                    };
+                }),
+            };
+        });
     }
 
+    // ── Rank-check loop ───────────────────────────────────────────────────────
     let seenCount = 0;
 
     for (let scroll = 0; scroll < MAX_SCROLL_ROUNDS; scroll++) {
@@ -134,6 +146,7 @@ export async function checkRankAtPoint({
                 ? Array.from(feed.querySelectorAll(':scope > div'))
                 : [];
 
+            // Fallback: article-role cards (alternate Maps layout)
             if (cards.length === 0) {
                 cards = Array.from(document.querySelectorAll('[role="article"]'));
             }
@@ -141,21 +154,18 @@ export async function checkRankAtPoint({
             return {
                 feedExists,
                 cards: cards.map((card) => {
-                    let dataCid = null;
-                    if (card.hasAttribute('data-cid')) {
-                        dataCid = card.getAttribute('data-cid');
-                    }
+                    // data-cid — check card + all descendants
+                    let dataCid = card.getAttribute('data-cid');
                     if (!dataCid) {
-                        const cidEl = card.querySelector('[data-cid]');
-                        if (cidEl) dataCid = cidEl.getAttribute('data-cid');
+                        dataCid = card.querySelector('[data-cid]')?.getAttribute('data-cid') ?? null;
                     }
                     if (dataCid && !/^\d+$/.test(dataCid)) dataCid = null;
 
                     const hrefs = Array.from(card.querySelectorAll('a[href]'))
-                        .map((a) => a.href)
+                        .map(a => a.href)
                         .filter(Boolean);
 
-                    const jslog = card.getAttribute('jslog') || null;
+                    const jslog = card.getAttribute('jslog') ?? null;
 
                     return { dataCid, hrefs, jslog };
                 }),
@@ -163,7 +173,7 @@ export async function checkRankAtPoint({
         });
 
         if (!extracted.feedExists && seenCount === 0) {
-            return { rank: null, ranked: false, error: 'feed_lost' };
+            return { rank: null, ranked: false, error: 'feed_lost', _debug };
         }
 
         const { cards } = extracted;
@@ -172,7 +182,7 @@ export async function checkRankAtPoint({
             const position = i + 1;
 
             if (position > maxRankToShow) {
-                return { rank: null, ranked: false };
+                return { rank: null, ranked: false, _debug };
             }
 
             const card = cards[i];
@@ -180,13 +190,12 @@ export async function checkRankAtPoint({
             // 1 ▸ data-cid direct match
             if (card.dataCid) {
                 if (targetIds.cid && card.dataCid === targetIds.cid) {
-                    return { rank: position, ranked: true };
+                    return { rank: position, ranked: true, _debug };
                 }
                 if (targetIds.hexId) {
                     try {
-                        const cidFromTargetHex = BigInt(targetIds.hexId.split(':')[1]).toString();
-                        if (card.dataCid === cidFromTargetHex) {
-                            return { rank: position, ranked: true };
+                        if (card.dataCid === BigInt(targetIds.hexId.split(':')[1]).toString()) {
+                            return { rank: position, ranked: true, _debug };
                         }
                     } catch { /* malformed */ }
                 }
@@ -197,15 +206,15 @@ export async function checkRankAtPoint({
                 const cardIds = extractIdsFromUrl(href);
                 if (!cardIds.placeId && !cardIds.hexId && !cardIds.cid) continue;
                 if (idsMatch(targetIds, cardIds)) {
-                    return { rank: position, ranked: true };
+                    return { rank: position, ranked: true, _debug };
                 }
             }
 
-            // 3 ▸ jslog numeric CID
+            // 3 ▸ jslog: Google sometimes embeds CID here as a 15-20-digit number
             if (card.jslog && targetIds.cid) {
-                const numMatch = card.jslog.match(/\b(\d{15,20})\b/);
-                if (numMatch && numMatch[1] === targetIds.cid) {
-                    return { rank: position, ranked: true };
+                const m = card.jslog.match(/\b(\d{15,20})\b/);
+                if (m && m[1] === targetIds.cid) {
+                    return { rank: position, ranked: true, _debug };
                 }
             }
         }
@@ -213,9 +222,10 @@ export async function checkRankAtPoint({
         seenCount = cards.length;
 
         if (seenCount >= maxRankToShow) {
-            return { rank: null, ranked: false };
+            return { rank: null, ranked: false, _debug };
         }
 
+        // Scroll feed to load more
         await page.evaluate(() => {
             const feed = document.querySelector('[role="feed"]');
             if (feed) feed.scrollBy(0, 800);
@@ -231,5 +241,5 @@ export async function checkRankAtPoint({
         if (newCount <= seenCount) break;
     }
 
-    return { rank: null, ranked: false };
+    return { rank: null, ranked: false, _debug };
 }

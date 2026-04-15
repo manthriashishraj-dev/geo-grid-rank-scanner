@@ -140,6 +140,10 @@ const crawler = new PlaywrightCrawler({
 
         await sleep(Math.random() * 400); // small jitter
 
+        // Capture raw card diagnostic for the first grid point (pointIndex 0)
+        // so we can inspect what IDs Google serves — included in dataset output.
+        const captureDebug = point.pointIndex === 0;
+
         const result = await checkRankAtPoint({
             page,
             keyword: request.userData.keyword,
@@ -148,6 +152,7 @@ const crawler = new PlaywrightCrawler({
             targetIds,
             maxRankToShow,
             language: request.userData.language,
+            captureDebug,
         });
 
         gridResults[point.pointIndex] = {
@@ -159,7 +164,8 @@ const crawler = new PlaywrightCrawler({
             quadrant:   point.quadrant,
             rank:       result.rank,
             ranked:     result.ranked,
-            ...(result.error ? { error: result.error } : {}),
+            ...(result.error  ? { error:  result.error  } : {}),
+            ...(result._debug ? { _debug: result._debug } : {}),
         };
 
         crawlerLog.info(result.ranked
