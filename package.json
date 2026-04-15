@@ -1,0 +1,18 @@
+{
+  "name": "geo-grid-rank-scanner",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Apify actor that checks a GMB business's Google Maps rank across an N×N geographic grid using direct Playwright scraping — no SerpAPI needed.",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "node src/main.js"
+  },
+  "dependencies": {
+    "apify": "^3.2.2",
+    "crawlee": "^3.9.0",
+    "playwright": "^1.44.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

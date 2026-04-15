@@ -1,0 +1,84 @@
+{
+  "title": "Geo-Grid Rank Scanner",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "keyword": {
+      "title": "Target Keyword",
+      "type": "string",
+      "description": "The search keyword to rank check. E.g. 'Dental clinic', 'dentist near me'.",
+      "editor": "textfield",
+      "example": "Dental clinic"
+    },
+    "placeId": {
+      "title": "Place ID (recommended)",
+      "type": "string",
+      "description": "Google Place ID of the target business (ChIJ... or hex-pair format). Provide this OR businessName. Place ID is more accurate.",
+      "editor": "textfield",
+      "example": "ChIJN1t_tDeuEmsRUsoyG83frY4"
+    },
+    "businessName": {
+      "title": "Business Name (if no Place ID)",
+      "type": "string",
+      "description": "Full business name. If placeId is not provided, the actor will auto-resolve it from this name on the first run.",
+      "editor": "textfield",
+      "example": "A.V Dental and Health Care"
+    },
+    "centerLat": {
+      "title": "Center Latitude",
+      "type": "number",
+      "description": "Latitude of the grid center (business location). E.g. 17.3850 for Hyderabad.",
+      "example": 17.3850
+    },
+    "centerLng": {
+      "title": "Center Longitude",
+      "type": "number",
+      "description": "Longitude of the grid center (business location). E.g. 78.4867 for Hyderabad.",
+      "example": 78.4867
+    },
+    "gridSize": {
+      "title": "Grid Size",
+      "type": "integer",
+      "description": "Creates an N×N grid of rank-check points. 7 = 49 points (standard), 3 = 9 points (hyper-local), 9 = 81 points (metro-wide).",
+      "editor": "select",
+      "enum": [3, 5, 7, 9],
+      "enumTitles": ["3×3 — 9 pts (Hyper-local)", "5×5 — 25 pts (Neighbourhood)", "7×7 — 49 pts (Standard)", "9×9 — 81 pts (Metro-wide)"],
+      "default": 7
+    },
+    "gridSpacingMeters": {
+      "title": "Grid Spacing (meters)",
+      "type": "integer",
+      "description": "Distance between adjacent grid points in meters.",
+      "editor": "select",
+      "enum": [300, 500, 1000, 2000],
+      "enumTitles": ["300m — Dense (city center)", "500m — Standard (optimal)", "1km — Suburb", "2km — Rural / large city"],
+      "default": 500
+    },
+    "maxRankToShow": {
+      "title": "Max Rank to Track",
+      "type": "integer",
+      "description": "If the business is ranked beyond this position at a grid point, record it as 'not ranked'. Default 20.",
+      "default": 20,
+      "minimum": 5,
+      "maximum": 50
+    },
+    "language": {
+      "title": "Language",
+      "type": "string",
+      "description": "Google Maps interface language (hl parameter).",
+      "editor": "textfield",
+      "default": "en"
+    },
+    "proxyConfiguration": {
+      "title": "Proxy Configuration",
+      "type": "object",
+      "description": "Residential proxies are mandatory — Google blocks datacenter IPs.",
+      "editor": "proxy",
+      "default": {
+        "useApifyProxy": true,
+        "apifyProxyGroups": ["RESIDENTIAL"]
+      }
+    }
+  },
+  "required": ["keyword", "centerLat", "centerLng"]
+}
