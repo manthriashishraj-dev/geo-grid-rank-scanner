@@ -94,7 +94,7 @@ export async function checkRankAtPoint({
         const hasDataCid = await page.$('[data-cid]');
         if (!hasDataCid) {
             if (captureDebug) {
-                let _debug = { note: 'no_feed' };
+                const _debug = { note: 'no_feed', lat, lng };
                 try {
                     _debug.pageUrl  = await page.evaluate(() => window.location.href);
                     _debug.bodySnip = await page.evaluate(() => document.body.innerText.slice(0, 500));
@@ -110,6 +110,8 @@ export async function checkRankAtPoint({
     // ── Capture DOM diagnostic snapshot if requested ──────────────────────────
     let _debug = undefined;
     if (captureDebug) {
+        // Hardcoded marker — confirms captureDebug=true even if page.evaluate fails
+        _debug = { _marker: 'captureDebug_active', lat, lng };
         try {
         _debug = await page.evaluate(() => {
             const feed = document.querySelector('[role="feed"]');
