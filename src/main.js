@@ -106,7 +106,8 @@ const requests = gridPoints.map((pt) => ({
 const crawler = new PlaywrightCrawler({
     proxyConfiguration: proxy,
     maxConcurrency: 10,
-    requestHandlerTimeoutSecs: 90,
+    requestHandlerTimeoutSecs: 120,
+    navigationTimeoutSecs: 45,   // prevent Crawlee default (60s) from overriding page.goto timeout
 
     launchContext: {
         launchOptions: {

@@ -83,13 +83,13 @@ export async function checkRankAtPoint({
         if (!hasDataCid) {
             // ── Save a diagnostic snapshot if feed is missing ──────────────
             if (!_diagSaved) {
-                _diagSaved = true;
                 try {
                     const bodyHtml = await page.evaluate(() => document.body.innerHTML.slice(0, 20000));
                     const screenshot = await page.screenshot({ type: 'jpeg', quality: 70 });
                     await Actor.setValue('diag_no_feed_html', bodyHtml, { contentType: 'text/html' });
                     await Actor.setValue('diag_no_feed_screenshot', screenshot, { contentType: 'image/jpeg' });
-                } catch { /* ignore diag errors */ }
+                    _diagSaved = true;
+                } catch { /* ignore */ }
             }
             return { rank: null, ranked: false, error: 'no_feed' };
         }
@@ -99,7 +99,6 @@ export async function checkRankAtPoint({
 
     // ── On the first grid point, save a full DOM diagnostic ────────────────
     if (!_diagSaved) {
-        _diagSaved = true;
         try {
             const diagData = await page.evaluate(() => {
                 const feed = document.querySelector('[role="feed"]');
@@ -132,7 +131,8 @@ export async function checkRankAtPoint({
             const screenshot = await page.screenshot({ type: 'jpeg', quality: 70 });
             await Actor.setValue('diag_dom', JSON.stringify(diagData, null, 2), { contentType: 'application/json' });
             await Actor.setValue('diag_screenshot', screenshot, { contentType: 'image/jpeg' });
-        } catch { /* ignore diag errors */ }
+            _diagSaved = true; // Only mark saved AFTER successful write
+        } catch { /* ignore diag errors — _diagSaved stays false so retry can try again */ }
     }
 
     let seenCount = 0;
