@@ -127,6 +127,18 @@ const crawler = new PlaywrightCrawler({
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             });
             await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+
+            // Pre-set SOCS cookie to bypass Google's GDPR/EU consent page.
+            // Residential proxies often route through EU/UK IPs which trigger consent.google.com.
+            // This cookie signals that the user has already accepted and skips the redirect.
+            try {
+                await page.context().addCookies([{
+                    name:   'SOCS',
+                    value:  'CAISHAgBEhJnd3NfMjAyMzA4MDItMF9SQzEaAmVuIAEaBgiAsLWmBg',
+                    domain: '.google.com',
+                    path:   '/',
+                }]);
+            } catch { /* context may not be ready */ }
         },
     ],
 
@@ -140,10 +152,6 @@ const crawler = new PlaywrightCrawler({
 
         await sleep(Math.random() * 400); // small jitter
 
-        // Capture raw card diagnostic for ALL points this debug run
-        // so we can inspect what IDs Google serves — included in dataset output.
-        const captureDebug = true;
-
         const result = await checkRankAtPoint({
             page,
             keyword: request.userData.keyword,
@@ -152,7 +160,6 @@ const crawler = new PlaywrightCrawler({
             targetIds,
             maxRankToShow,
             language: request.userData.language,
-            captureDebug,
         });
 
         gridResults[point.pointIndex] = {
@@ -164,8 +171,7 @@ const crawler = new PlaywrightCrawler({
             quadrant:   point.quadrant,
             rank:       result.rank,
             ranked:     result.ranked,
-            ...(result.error  ? { error:  result.error  } : {}),
-            ...(result._debug ? { _debug: result._debug } : {}),
+            ...(result.error ? { error: result.error } : {}),
         };
 
         crawlerLog.info(result.ranked
@@ -269,15 +275,10 @@ const summary = {
 
 // ─── Output ───────────────────────────────────────────────────────────────────
 
-// Collect _debug fields from gridResults to top-level for inspection
-const _debugCards = annotatedResults
-    .filter(pt => pt._debug)
-    .map(pt => ({ pointIndex: pt.pointIndex, lat: pt.lat, lng: pt.lng, _debug: pt._debug }));
-
 await Actor.pushData({
     keyword,
     businessName:   displayName,
-    targetIds,           // all resolved ID formats for reference
+    targetIds,
     centerLat,
     centerLng,
     gridSize,
@@ -288,7 +289,6 @@ await Actor.pushData({
     gridResults:    annotatedResults,
     gridMatrix,
     summary,
-    _debugCards,    // raw card DOM data for first few points (debug mode only)
 });
 
 log.info('=== Scan Complete ===');

@@ -9,6 +9,14 @@
  *  2. CID derived from hex-pair in card href  (!1s0x...:0x... data blob)
  *  3. Same hex-pair exact match
  *  4. Same ChIJ PlaceId match
+ *
+ * Non-result cards (filter carousels, "Results" headers, spacer divs) are
+ * detected by having zero hrefs and no dataCid, and are skipped so they don't
+ * inflate the rank count.
+ *
+ * Consent page handling: residential proxies may route through EU/UK IPs and
+ * trigger consent.google.com. A SOCS cookie is pre-injected in main.js; this
+ * module also handles the click-through as a fallback.
  */
 
 import { sleep } from 'crawlee';
@@ -65,8 +73,7 @@ function extractIdsFromUrl(url) {
  * @param {import('./extractPlaceId.js').GmbIds} params.targetIds
  * @param {number}  [params.maxRankToShow]
  * @param {string}  [params.language]
- * @param {boolean} [params.captureDebug]  — if true, return raw card data for inspection
- * @returns {Promise<{rank,ranked,error?,_debug?}>}
+ * @returns {Promise<{rank: number|null, ranked: boolean, error?: string}>}
  */
 export async function checkRankAtPoint({
     page,
@@ -76,7 +83,6 @@ export async function checkRankAtPoint({
     targetIds,
     maxRankToShow = 20,
     language      = 'en',
-    captureDebug  = false,
 }) {
     const url = buildGridPointUrl(keyword, lat, lng, language);
 
@@ -87,57 +93,42 @@ export async function checkRankAtPoint({
         return { rank: null, ranked: false, error: `nav_timeout: ${err.message}` };
     }
 
+    // ── Handle Google consent page (GDPR — EU/UK residential proxies) ─────────
+    // The SOCS cookie in preNavigationHooks usually bypasses this, but as a
+    // fallback we click "Accept all" if we land on consent.google.com.
+    if (page.url().includes('consent.google.com')) {
+        try {
+            await sleep(1000);
+            const accepted = await page.evaluate(() => {
+                const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+                const acceptBtn = btns.find(b => {
+                    const txt = (b.innerText || b.textContent || '').trim().toLowerCase();
+                    return txt && /^(accept all|i agree|agree|tout accepter|alle akzeptieren|aceptar todo|accetta tutto)/.test(txt);
+                });
+                const firstBtn = acceptBtn || btns.find(b => b.offsetParent !== null);
+                if (firstBtn) { firstBtn.click(); return true; }
+                return false;
+            });
+            if (accepted) {
+                await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => {});
+                if (page.url().includes('consent.google.com')) {
+                    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+                }
+            }
+        } catch { /* consent bypass failed */ }
+    }
+
     // ── Wait for result feed ──────────────────────────────────────────────────
     try {
         await page.waitForSelector('[role="feed"]', { timeout: CARD_WAIT_MS });
     } catch {
         const hasDataCid = await page.$('[data-cid]');
         if (!hasDataCid) {
-            if (captureDebug) {
-                const _debug = { note: 'no_feed', lat, lng };
-                try {
-                    _debug.pageUrl  = await page.evaluate(() => window.location.href);
-                    _debug.bodySnip = await page.evaluate(() => document.body.innerText.slice(0, 500));
-                } catch { /* context may be closed */ }
-                return { rank: null, ranked: false, error: 'no_feed', _debug };
-            }
             return { rank: null, ranked: false, error: 'no_feed' };
         }
     }
 
     await sleep(800);
-
-    // ── Capture DOM diagnostic snapshot if requested ──────────────────────────
-    let _debug = undefined;
-    if (captureDebug) {
-        // Hardcoded marker — confirms captureDebug=true even if page.evaluate fails
-        _debug = { _marker: 'captureDebug_active', lat, lng };
-        try {
-        _debug = await page.evaluate(() => {
-            const feed = document.querySelector('[role="feed"]');
-            const feedChildren = feed ? Array.from(feed.children) : [];
-            const allCidEls   = Array.from(document.querySelectorAll('[data-cid]'));
-            return {
-                pageUrl:        window.location.href,
-                feedExists:     !!feed,
-                feedChildCount: feedChildren.length,
-                feedHTML:       feed ? feed.outerHTML.slice(0, 3000) : null,
-                allCids:        allCidEls.map(el => el.getAttribute('data-cid')),
-                firstCards:     feedChildren.slice(0, 5).map((card) => {
-                    const anchors = Array.from(card.querySelectorAll('a[href]'));
-                    return {
-                        tag:     card.tagName,
-                        attrs:   Array.from(card.attributes).map(a => `${a.name}="${a.value.slice(0, 80)}"`),
-                        dataCid: card.getAttribute('data-cid') || card.querySelector('[data-cid]')?.getAttribute('data-cid') || null,
-                        hrefs:   anchors.map(a => a.href).slice(0, 5),
-                        jslog:   card.getAttribute('jslog') || null,
-                        snippet: card.outerHTML.slice(0, 800),
-                    };
-                }),
-            };
-        });
-        } catch { /* page context may be gone */ }
-    }
 
     // ── Rank-check loop ───────────────────────────────────────────────────────
     let seenCount = 0;
@@ -179,29 +170,40 @@ export async function checkRankAtPoint({
         });
 
         if (!extracted.feedExists && seenCount === 0) {
-            return { rank: null, ranked: false, error: 'feed_lost', _debug };
+            return { rank: null, ranked: false, error: 'feed_lost' };
         }
 
         const { cards } = extracted;
 
+        // Track effective rank separately — non-result cards (filter bars, headers,
+        // spacer divs between results) are skipped by checking for hrefs or dataCid.
+        let effectiveRank = seenCount === 0
+            ? 0
+            : cards.slice(0, seenCount).filter(c => c.hrefs.length > 0 || c.dataCid).length;
+
         for (let i = seenCount; i < cards.length; i++) {
-            const position = i + 1;
+            const card = cards[i];
+
+            // Skip non-result cards: filter carousels, "Results" headers, spacers, etc.
+            const isResultCard = card.hrefs.length > 0 || !!card.dataCid;
+            if (!isResultCard) continue;
+
+            effectiveRank++;
+            const position = effectiveRank;
 
             if (position > maxRankToShow) {
-                return { rank: null, ranked: false, _debug };
+                return { rank: null, ranked: false };
             }
-
-            const card = cards[i];
 
             // 1 ▸ data-cid direct match
             if (card.dataCid) {
                 if (targetIds.cid && card.dataCid === targetIds.cid) {
-                    return { rank: position, ranked: true, _debug };
+                    return { rank: position, ranked: true };
                 }
                 if (targetIds.hexId) {
                     try {
                         if (card.dataCid === BigInt(targetIds.hexId.split(':')[1]).toString()) {
-                            return { rank: position, ranked: true, _debug };
+                            return { rank: position, ranked: true };
                         }
                     } catch { /* malformed */ }
                 }
@@ -212,7 +214,7 @@ export async function checkRankAtPoint({
                 const cardIds = extractIdsFromUrl(href);
                 if (!cardIds.placeId && !cardIds.hexId && !cardIds.cid) continue;
                 if (idsMatch(targetIds, cardIds)) {
-                    return { rank: position, ranked: true, _debug };
+                    return { rank: position, ranked: true };
                 }
             }
 
@@ -220,18 +222,18 @@ export async function checkRankAtPoint({
             if (card.jslog && targetIds.cid) {
                 const m = card.jslog.match(/\b(\d{15,20})\b/);
                 if (m && m[1] === targetIds.cid) {
-                    return { rank: position, ranked: true, _debug };
+                    return { rank: position, ranked: true };
                 }
             }
         }
 
         seenCount = cards.length;
 
-        if (seenCount >= maxRankToShow) {
-            return { rank: null, ranked: false, _debug };
+        if (effectiveRank >= maxRankToShow) {
+            return { rank: null, ranked: false };
         }
 
-        // Scroll feed to load more
+        // Scroll feed to load more results
         await page.evaluate(() => {
             const feed = document.querySelector('[role="feed"]');
             if (feed) feed.scrollBy(0, 800);
@@ -247,5 +249,5 @@ export async function checkRankAtPoint({
         if (newCount <= seenCount) break;
     }
 
-    return { rank: null, ranked: false, _debug };
+    return { rank: null, ranked: false };
 }
