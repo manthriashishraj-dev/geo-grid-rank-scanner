@@ -93,11 +93,13 @@ export async function checkRankAtPoint({
     } catch {
         const hasDataCid = await page.$('[data-cid]');
         if (!hasDataCid) {
-            // Capture DOM for debugging if requested
             if (captureDebug) {
-                const pageUrl  = await page.evaluate(() => window.location.href);
-                const bodySnip = await page.evaluate(() => document.body.innerText.slice(0, 500));
-                return { rank: null, ranked: false, error: 'no_feed', _debug: { pageUrl, bodySnip } };
+                let _debug = { note: 'no_feed' };
+                try {
+                    _debug.pageUrl  = await page.evaluate(() => window.location.href);
+                    _debug.bodySnip = await page.evaluate(() => document.body.innerText.slice(0, 500));
+                } catch { /* context may be closed */ }
+                return { rank: null, ranked: false, error: 'no_feed', _debug };
             }
             return { rank: null, ranked: false, error: 'no_feed' };
         }
@@ -108,6 +110,7 @@ export async function checkRankAtPoint({
     // ── Capture DOM diagnostic snapshot if requested ──────────────────────────
     let _debug = undefined;
     if (captureDebug) {
+        try {
         _debug = await page.evaluate(() => {
             const feed = document.querySelector('[role="feed"]');
             const feedChildren = feed ? Array.from(feed.children) : [];
@@ -131,6 +134,7 @@ export async function checkRankAtPoint({
                 }),
             };
         });
+        } catch { /* page context may be gone */ }
     }
 
     // ── Rank-check loop ───────────────────────────────────────────────────────

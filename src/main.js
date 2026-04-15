@@ -140,9 +140,9 @@ const crawler = new PlaywrightCrawler({
 
         await sleep(Math.random() * 400); // small jitter
 
-        // Capture raw card diagnostic for the first grid point (pointIndex 0)
+        // Capture raw card diagnostic for ALL points this debug run
         // so we can inspect what IDs Google serves — included in dataset output.
-        const captureDebug = point.pointIndex === 0;
+        const captureDebug = true;
 
         const result = await checkRankAtPoint({
             page,
