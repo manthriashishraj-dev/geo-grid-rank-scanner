@@ -67,6 +67,7 @@ export async function checkRankAtPoint({
     language      = 'en',
 }) {
     const url = buildGridPointUrl(keyword, lat, lng, language);
+    process.stdout.write(`SCRAPE_START lat=${lat} lng=${lng}\n`);
 
     try {
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -112,12 +113,12 @@ export async function checkRankAtPoint({
                     allCids: allCidEls.map(el => el.getAttribute('data-cid')).slice(0, 10),
                 };
             });
-            // Log to actor output — visible in Apify console
-            console.log('DIAG_START');
-            console.log(JSON.stringify(diagData, null, 2));
-            console.log('DIAG_END');
+            // Write directly to stdout — bypasses any log-level filtering
+            process.stdout.write('DIAG_START\n');
+            process.stdout.write(JSON.stringify(diagData, null, 2) + '\n');
+            process.stdout.write('DIAG_END\n');
         } catch (e) {
-            console.log('DIAG_ERROR:', e.message);
+            process.stdout.write('DIAG_ERROR: ' + e.message + '\n');
         }
     }
 
