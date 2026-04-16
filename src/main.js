@@ -31,6 +31,7 @@ const {
     placeId,
     cid,
     hexId,
+    businessName:      inputBusinessName = null,  // optional override for display name
     centerLat,
     centerLng,
     gridSize           = 7,
@@ -67,9 +68,10 @@ if (!googleMapsUrl && !placeId && !cid && !hexId) {
 
 const targetIds = normaliseTargetIds({ googleMapsUrl, placeId, cid, hexId });
 
-// Extract a display name from the Maps URL path for logging/output (cosmetic only)
-let displayName = null;
-if (googleMapsUrl) {
+// Resolve display name (cosmetic only — no matching logic depends on this)
+// Priority: explicit businessName input → extracted from googleMapsUrl → null
+let displayName = inputBusinessName || null;
+if (!displayName && googleMapsUrl) {
     const m = googleMapsUrl.match(/maps\/place\/([^/@]+)/);
     if (m) displayName = decodeURIComponent(m[1].replace(/\+/g, ' '));
 }
@@ -418,6 +420,7 @@ await Actor.pushData({
     gridSize,
     gridSpacingMeters,
     maxRankToShow,
+    proxyCountry:   proxyCountry || 'auto',
     scanDate:       new Date().toISOString().split('T')[0],
     scanTimestamp:  new Date().toISOString(),
     gridResults:    annotatedResults,
