@@ -180,7 +180,8 @@ const crawler = new PlaywrightCrawler({
 
         // Retryable errors: throw so Crawlee's maxRequestRetries kicks in.
         // Non-retryable (rank found, or clean "not in top N") are stored directly.
-        if (result.error && ['no_feed', 'nav_timeout', 'feed_lost'].some(e => result.error.startsWith(e))) {
+        const RETRYABLE = ['no_feed', 'nav_timeout', 'feed_lost', 'consent_bypass_failed', 'captcha'];
+        if (result.error && RETRYABLE.some(e => result.error.startsWith(e))) {
             throw new Error(`retryable: ${result.error}`);
         }
 
@@ -217,6 +218,117 @@ const crawler = new PlaywrightCrawler({
 
 await crawler.addRequests(requests);
 await crawler.run();
+
+// ─── Second-pass: retry any still-errored points ──────────────────────────────
+// After the primary crawl (with maxRequestRetries:2), some points may still
+// have error: 'no_feed' | 'request_failed' etc. Run a slower, more patient
+// second pass on just those points (concurrency 2, no concurrency stress).
+
+const erroredPoints = gridPoints.filter((pt) => {
+    const res = gridResults[pt.pointIndex];
+    return !res || res.error;
+});
+
+if (erroredPoints.length > 0) {
+    log.info(`Second pass: retrying ${erroredPoints.length} errored points at lower concurrency…`);
+
+    const crawler2 = new PlaywrightCrawler({
+        proxyConfiguration: proxy,
+        maxConcurrency: 2,
+        maxRequestRetries: 1,
+        requestHandlerTimeoutSecs: 180,
+        navigationTimeoutSecs: 75,
+
+        launchContext: {
+            launchOptions: {
+                headless: true,
+                args: [
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-blink-features=AutomationControlled',
+                    '--lang=en-US',
+                ],
+            },
+        },
+
+        preNavigationHooks: [
+            async ({ page }) => {
+                await page.addInitScript(() => {
+                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                });
+                await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+                try {
+                    await page.context().addCookies([{
+                        name:   'SOCS',
+                        value:  'CAISHAgBEhJnd3NfMjAyMzA4MDItMF9SQzEaAmVuIAEaBgiAsLWmBg',
+                        domain: '.google.com',
+                        path:   '/',
+                    }]);
+                } catch { /* context may not be ready */ }
+            },
+        ],
+
+        requestHandler: async ({ request, page, log: crawlerLog }) => {
+            const { point } = request.userData;
+            crawlerLog.info(`[2nd-pass] (${point.lat}, ${point.lng})`);
+            await sleep(500 + Math.random() * 800);
+
+            const result = await checkRankAtPoint({
+                page,
+                keyword: request.userData.keyword,
+                lat:     point.lat,
+                lng:     point.lng,
+                targetIds,
+                maxRankToShow,
+                language: request.userData.language,
+            });
+
+            const RETRYABLE2 = ['no_feed', 'nav_timeout', 'feed_lost', 'consent_bypass_failed', 'captcha'];
+            if (result.error && RETRYABLE2.some(e => result.error.startsWith(e))) {
+                throw new Error(`retryable: ${result.error}`);
+            }
+
+            gridResults[point.pointIndex] = {
+                pointIndex: point.pointIndex,
+                row: point.row, col: point.col,
+                lat: point.lat, lng: point.lng,
+                quadrant: point.quadrant,
+                rank: result.rank,
+                ranked: result.ranked,
+                ...(result.error ? { error: result.error } : {}),
+            };
+
+            crawlerLog.info(result.ranked ? `  → Rank #${result.rank}` : `  → Not in top ${maxRankToShow}`);
+        },
+
+        failedRequestHandler: async ({ request, log: crawlerLog }) => {
+            crawlerLog.error(`[2nd-pass] Failed: ${request.url}`);
+            const { point } = request.userData;
+            // Keep whatever was there before (first-pass error) rather than overwriting
+            if (!gridResults[point.pointIndex]) {
+                gridResults[point.pointIndex] = {
+                    pointIndex: point.pointIndex,
+                    row: point.row, col: point.col,
+                    lat: point.lat, lng: point.lng,
+                    quadrant: point.quadrant,
+                    rank: null, ranked: false, error: 'request_failed',
+                };
+            }
+        },
+    });
+
+    const retryRequests = erroredPoints.map((pt) => ({
+        url: `https://www.google.com/maps/search/${encodeURIComponent(keyword)}/@${pt.lat},${pt.lng},14z?hl=${language}`,
+        label: 'GRID_POINT',
+        userData: { point: pt, keyword, language },
+    }));
+
+    await crawler2.addRequests(retryRequests);
+    await crawler2.run();
+
+    const resolved = erroredPoints.filter((pt) => gridResults[pt.pointIndex] && !gridResults[pt.pointIndex].error);
+    log.info(`Second pass complete. Resolved ${resolved.length}/${erroredPoints.length} previously errored points.`);
+}
 
 // ─── Summary ──────────────────────────────────────────────────────────────────
 
