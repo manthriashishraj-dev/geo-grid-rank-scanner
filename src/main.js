@@ -37,6 +37,11 @@ const {
     gridSpacingMeters  = 500,
     maxRankToShow      = 20,
     language           = 'en',
+    // proxyCountry: ISO-3166-1 alpha-2 country code for residential proxy routing.
+    // CRITICAL for accurate results — proxies must be in the SAME COUNTRY as your
+    // target audience. Using UK/US proxies for India shows wrong/different results.
+    // Example: "IN" for India, "US" for USA, "GB" for UK.
+    proxyCountry       = null,
     proxyConfiguration = { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] },
 } = input;
 
@@ -77,7 +82,17 @@ log.info(`Target IDs: placeId=${targetIds.placeId || '-'} | cid=${targetIds.cid 
 
 // ─── Proxy ────────────────────────────────────────────────────────────────────
 
-const proxy = await Actor.createProxyConfiguration(proxyConfiguration);
+// If proxyCountry is set, inject it into the proxy config so residential proxies
+// route through that country. This is essential for getting local-accurate results.
+const resolvedProxyConfig = proxyCountry
+    ? { ...proxyConfiguration, countryCode: proxyCountry }
+    : proxyConfiguration;
+
+if (proxyCountry) {
+    log.info(`Proxy country: ${proxyCountry} (residential IPs from that country)`);
+}
+
+const proxy = await Actor.createProxyConfiguration(resolvedProxyConfig);
 
 // ─── Generate grid points ─────────────────────────────────────────────────────
 

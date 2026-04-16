@@ -131,26 +131,31 @@ export async function checkRankAtPoint({
     await sleep(800);
 
     // ── Rank-check loop ───────────────────────────────────────────────────────
-    let seenCount = 0;
+    //
+    // Strategy: on EVERY scroll round, re-scan ALL cards from scratch.
+    // This correctly handles Google Maps' lazy-loading pattern where cards
+    // are rendered in the DOM with empty hrefs initially, and get their hrefs
+    // populated only when scrolled into view. A seenCount-based incremental
+    // approach would miscount because "empty" cards become "result" cards
+    // between rounds, inflating the effectiveRank base.
+    //
+    let prevTotalCards = 0;
 
     for (let scroll = 0; scroll < MAX_SCROLL_ROUNDS; scroll++) {
 
         const extracted = await page.evaluate(() => {
             const feed = document.querySelector('[role="feed"]');
-            const feedExists = !!feed;
+            if (!feed) return { feedExists: false, cards: [] };
 
-            let cards = feedExists
-                ? Array.from(feed.querySelectorAll(':scope > div'))
-                : [];
-
-            // Fallback: article-role cards (alternate Maps layout)
-            if (cards.length === 0) {
-                cards = Array.from(document.querySelectorAll('[role="article"]'));
+            let rawCards = Array.from(feed.querySelectorAll(':scope > div'));
+            if (rawCards.length === 0) {
+                // Fallback: article-role cards (alternate Maps layout)
+                rawCards = Array.from(document.querySelectorAll('[role="article"]'));
             }
 
             return {
-                feedExists,
-                cards: cards.map((card) => {
+                feedExists: true,
+                cards: rawCards.map((card) => {
                     // data-cid — check card + all descendants
                     let dataCid = card.getAttribute('data-cid');
                     if (!dataCid) {
@@ -158,9 +163,13 @@ export async function checkRankAtPoint({
                     }
                     if (dataCid && !/^\d+$/.test(dataCid)) dataCid = null;
 
+                    // Only count fully-resolved HTTP hrefs.
+                    // Google lazy-loads result cards with empty href="" initially;
+                    // element.href resolves to the page URL with fragment, e.g.
+                    // "https://maps.google.com/maps/search/...#" — filter those out.
                     const hrefs = Array.from(card.querySelectorAll('a[href]'))
                         .map(a => a.href)
-                        .filter(Boolean);
+                        .filter(h => h && /^https?:\/\//.test(h) && !/[/#]$/.test(h));
 
                     const jslog = card.getAttribute('jslog') ?? null;
 
@@ -169,41 +178,35 @@ export async function checkRankAtPoint({
             };
         });
 
-        if (!extracted.feedExists && seenCount === 0) {
+        if (!extracted.feedExists && scroll === 0) {
             return { rank: null, ranked: false, error: 'feed_lost' };
         }
 
         const { cards } = extracted;
 
-        // Track effective rank separately — non-result cards (filter bars, headers,
-        // spacer divs between results) are skipped by checking for hrefs or dataCid.
-        let effectiveRank = seenCount === 0
-            ? 0
-            : cards.slice(0, seenCount).filter(c => c.hrefs.length > 0 || c.dataCid).length;
+        // Full scan of ALL cards this round (re-scan from 0 every time).
+        // effectiveRank counts only result cards (non-empty hrefs or dataCid).
+        let effectiveRank = 0;
 
-        for (let i = seenCount; i < cards.length; i++) {
-            const card = cards[i];
-
-            // Skip non-result cards: filter carousels, "Results" headers, spacers, etc.
+        for (const card of cards) {
             const isResultCard = card.hrefs.length > 0 || !!card.dataCid;
             if (!isResultCard) continue;
 
             effectiveRank++;
-            const position = effectiveRank;
 
-            if (position > maxRankToShow) {
+            if (effectiveRank > maxRankToShow) {
                 return { rank: null, ranked: false };
             }
 
             // 1 ▸ data-cid direct match
             if (card.dataCid) {
                 if (targetIds.cid && card.dataCid === targetIds.cid) {
-                    return { rank: position, ranked: true };
+                    return { rank: effectiveRank, ranked: true };
                 }
                 if (targetIds.hexId) {
                     try {
                         if (card.dataCid === BigInt(targetIds.hexId.split(':')[1]).toString()) {
-                            return { rank: position, ranked: true };
+                            return { rank: effectiveRank, ranked: true };
                         }
                     } catch { /* malformed */ }
                 }
@@ -214,7 +217,7 @@ export async function checkRankAtPoint({
                 const cardIds = extractIdsFromUrl(href);
                 if (!cardIds.placeId && !cardIds.hexId && !cardIds.cid) continue;
                 if (idsMatch(targetIds, cardIds)) {
-                    return { rank: position, ranked: true };
+                    return { rank: effectiveRank, ranked: true };
                 }
             }
 
@@ -222,31 +225,71 @@ export async function checkRankAtPoint({
             if (card.jslog && targetIds.cid) {
                 const m = card.jslog.match(/\b(\d{15,20})\b/);
                 if (m && m[1] === targetIds.cid) {
-                    return { rank: position, ranked: true };
+                    return { rank: effectiveRank, ranked: true };
                 }
             }
         }
 
-        seenCount = cards.length;
-
+        // Not found yet — check if we've seen enough results
         if (effectiveRank >= maxRankToShow) {
             return { rank: null, ranked: false };
         }
 
-        // Scroll feed to load more results
+        const currentTotalCards = cards.length;
+
+        // Scroll to load more results.
+        //
+        // Google Maps makes [role="feed"] itself the scrollable container (overflow:auto
+        // on the feed element). BUT: before the first lazy-load, scrollHeight === clientHeight
+        // so feed.scrollBy() is a no-op. scrollIntoView on the last child triggers the
+        // initial lazy load; after that feed.scrollBy works normally.
+        //
+        // Walk order: feed itself → feed's ancestors (handles layout variations).
         await page.evaluate(() => {
             const feed = document.querySelector('[role="feed"]');
-            if (feed) feed.scrollBy(0, 800);
+            if (!feed) return;
+
+            let scrolled = false;
+
+            // 1. Try the feed element itself first (most common in Maps)
+            const feedStyle = window.getComputedStyle(feed);
+            if (/auto|scroll/.test(feedStyle.overflow + feedStyle.overflowY)
+                    && feed.scrollHeight > feed.clientHeight) {
+                feed.scrollBy(0, 2400);
+                scrolled = true;
+            }
+
+            // 2. If feed not scrollable, walk up to find the scrollable ancestor
+            if (!scrolled) {
+                let el = feed.parentElement;
+                while (el && el !== document.body) {
+                    const { overflow, overflowY } = window.getComputedStyle(el);
+                    if (/auto|scroll/.test(overflow + overflowY) && el.scrollHeight > el.clientHeight) {
+                        el.scrollBy(0, 2400);
+                        scrolled = true;
+                        break;
+                    }
+                    el = el.parentElement;
+                }
+            }
+
+            // 3. Always scrollIntoView the last child — triggers the FIRST lazy load
+            //    when feed isn't yet scrollable, and also triggers loading of the next
+            //    batch of results after every scroll.
+            const lastChild = feed.lastElementChild;
+            if (lastChild) lastChild.scrollIntoView({ block: 'end' });
         });
         await sleep(SCROLL_PAUSE_MS);
 
-        const newCount = await page.evaluate(() => {
+        const newTotalCards = await page.evaluate(() => {
             const feed = document.querySelector('[role="feed"]');
             if (feed) return feed.querySelectorAll(':scope > div').length;
             return document.querySelectorAll('[role="article"]').length;
         });
 
-        if (newCount <= seenCount) break;
+        // Stop scrolling if the feed has stopped growing
+        if (newTotalCards <= prevTotalCards && scroll > 0) break;
+        prevTotalCards = newTotalCards;
     }
 
     return { rank: null, ranked: false };

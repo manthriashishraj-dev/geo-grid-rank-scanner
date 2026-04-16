@@ -84,10 +84,17 @@
       "editor": "textfield",
       "default": "en"
     },
+    "proxyCountry": {
+      "title": "Proxy Country Code (CRITICAL for accuracy)",
+      "type": "string",
+      "description": "ISO-3166 country code to route residential proxies through. MUST match your target market — using the wrong country shows completely different results. E.g. 'IN' for India, 'US' for USA, 'GB' for UK. Leave blank to let Apify pick automatically (not recommended).",
+      "editor": "textfield",
+      "example": "IN"
+    },
     "proxyConfiguration": {
       "title": "Proxy Configuration",
       "type": "object",
-      "description": "Residential proxies are mandatory — Google blocks datacenter IPs on Maps searches.",
+      "description": "Residential proxies are mandatory — Google blocks datacenter IPs on Maps searches. Pair with Proxy Country Code above for accurate local results.",
       "editor": "proxy",
       "default": {
         "useApifyProxy": true,
