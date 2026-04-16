@@ -23,8 +23,8 @@ import { sleep } from 'crawlee';
 import { idsMatch } from './extractPlaceId.js';
 import { buildGridPointUrl } from './generateGrid.js';
 
-const SCROLL_PAUSE_MS   = 1400;
-const CARD_WAIT_MS      = 6000;
+const SCROLL_PAUSE_MS   = 1500;
+const CARD_WAIT_MS      = 9000;
 const MAX_SCROLL_ROUNDS = 10;
 
 // ─── URL ID extractor (Node.js side) ─────────────────────────────────────────
@@ -88,7 +88,7 @@ export async function checkRankAtPoint({
 
     // ── Navigate ──────────────────────────────────────────────────────────────
     try {
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
     } catch (err) {
         return { rank: null, ranked: false, error: `nav_timeout: ${err.message}` };
     }

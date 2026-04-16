@@ -120,9 +120,10 @@ const requests = gridPoints.map((pt) => ({
 
 const crawler = new PlaywrightCrawler({
     proxyConfiguration: proxy,
-    maxConcurrency: 10,
-    requestHandlerTimeoutSecs: 120,
-    navigationTimeoutSecs: 45,   // prevent Crawlee default (60s) from overriding page.goto timeout
+    maxConcurrency: 5,            // lower concurrency = less proxy stress = fewer no_feed errors
+    maxRequestRetries: 2,         // auto-retry nav_timeout / no_feed up to 2 extra times
+    requestHandlerTimeoutSecs: 150,
+    navigationTimeoutSecs: 60,    // prevent Crawlee default (60s) from overriding page.goto timeout
 
     launchContext: {
         launchOptions: {
@@ -176,6 +177,12 @@ const crawler = new PlaywrightCrawler({
             maxRankToShow,
             language: request.userData.language,
         });
+
+        // Retryable errors: throw so Crawlee's maxRequestRetries kicks in.
+        // Non-retryable (rank found, or clean "not in top N") are stored directly.
+        if (result.error && ['no_feed', 'nav_timeout', 'feed_lost'].some(e => result.error.startsWith(e))) {
+            throw new Error(`retryable: ${result.error}`);
+        }
 
         gridResults[point.pointIndex] = {
             pointIndex: point.pointIndex,
