@@ -186,7 +186,7 @@ async function waitForFeed(page) {
  * @param {import('./extractPlaceId.js').GmbIds} params.targetIds
  * @param {number}  [params.maxRankToShow]
  * @param {string}  [params.language]
- * @returns {Promise<{rank: number|null, ranked: boolean, error?: string, top5: Array}>}
+ * @returns {Promise<{rank: number|null, ranked: boolean, error?: string, competitors: Array}>}
  */
 export async function checkRankAtPoint({
     page,
@@ -219,18 +219,18 @@ export async function checkRankAtPoint({
         await sleep(800); // reduced from 1500ms
         state = await detectPageState(page);
         if (state === 'consent') {
-            return { rank: null, ranked: false, error: 'consent_bypass_failed', top5: [] };
+            return { rank: null, ranked: false, error: 'consent_bypass_failed', competitors: [] };
         }
     }
 
     // Captcha → retryable (different proxy IP on retry)
     if (state === 'captcha') {
-        return { rank: null, ranked: false, error: 'captcha', top5: [] };
+        return { rank: null, ranked: false, error: 'captcha', competitors: [] };
     }
 
     // Legitimate "no results in this area" → clean not-ranked, not an error
     if (state === 'no_results') {
-        return { rank: null, ranked: false, top5: [] };
+        return { rank: null, ranked: false, competitors: [] };
     }
 
     // ── Wait for feed ─────────────────────────────────────────────────────────
@@ -238,10 +238,10 @@ export async function checkRankAtPoint({
 
     if (!feedReady) {
         const finalState = await detectPageState(page);
-        if (finalState === 'no_results') return { rank: null, ranked: false, top5: [] };
-        if (finalState === 'consent')    return { rank: null, ranked: false, error: 'consent_bypass_failed', top5: [] };
-        if (finalState === 'captcha')    return { rank: null, ranked: false, error: 'captcha', top5: [] };
-        return { rank: null, ranked: false, error: 'no_feed', top5: [] };
+        if (finalState === 'no_results') return { rank: null, ranked: false, competitors: [] };
+        if (finalState === 'consent')    return { rank: null, ranked: false, error: 'consent_bypass_failed', competitors: [] };
+        if (finalState === 'captcha')    return { rank: null, ranked: false, error: 'captcha', competitors: [] };
+        return { rank: null, ranked: false, error: 'no_feed', competitors: [] };
     }
 
     await sleep(300); // reduced from 800ms — feed selector confirmed present
@@ -257,7 +257,7 @@ export async function checkRankAtPoint({
     // (or gives up after SCROLL_WAIT_MAX ms) — no blind fixed sleep.
     //
     let prevTotalCards = 0;
-    let top5 = [];
+    let competitors = [];
 
     for (let round = 0; round < MAX_SCROLL_ROUNDS; round++) {
 
@@ -338,8 +338,8 @@ export async function checkRankAtPoint({
 
         if (!extracted.feedExists && round === 0) {
             const s = await detectPageState(page);
-            if (s === 'no_results') return { rank: null, ranked: false, top5: [] };
-            return { rank: null, ranked: false, error: 'feed_lost', top5: [] };
+            if (s === 'no_results') return { rank: null, ranked: false, competitors: [] };
+            return { rank: null, ranked: false, error: 'feed_lost', competitors: [] };
         }
 
         const { cards, totalCards } = extracted;
@@ -358,24 +358,26 @@ export async function checkRankAtPoint({
 
             effectiveRank++;
 
-            // Collect top-5 for competitor intelligence
-            if (top5.length < 5 && card.name) {
-                top5.push({ rank: effectiveRank, name: card.name, cid: card.dataCid || null });
+            // Collect ALL competitors above the target business.
+            // We add every named card here; when we find the target at rank N,
+            // we return only the slice where rank < N (all businesses above it).
+            if (card.name) {
+                competitors.push({ rank: effectiveRank, name: card.name, cid: card.dataCid || null });
             }
 
             if (effectiveRank > maxRankToShow) {
-                return { rank: null, ranked: false, top5 };
+                return { rank: null, ranked: false, competitors };
             }
 
             // 1 ▸ data-cid direct match
             if (card.dataCid) {
                 if (targetIds.cid && card.dataCid === targetIds.cid) {
-                    return { rank: effectiveRank, ranked: true, top5 };
+                    return { rank: effectiveRank, ranked: true, competitors: competitors.filter(c => c.rank < effectiveRank) };
                 }
                 if (targetIds.hexId) {
                     try {
                         if (card.dataCid === BigInt(targetIds.hexId.split(':')[1]).toString()) {
-                            return { rank: effectiveRank, ranked: true, top5 };
+                            return { rank: effectiveRank, ranked: true, competitors: competitors.filter(c => c.rank < effectiveRank) };
                         }
                     } catch { /* malformed */ }
                 }
@@ -386,7 +388,7 @@ export async function checkRankAtPoint({
                 const cardIds = extractIdsFromUrl(href);
                 if (!cardIds.placeId && !cardIds.hexId && !cardIds.cid) continue;
                 if (idsMatch(targetIds, cardIds)) {
-                    return { rank: effectiveRank, ranked: true, top5 };
+                    return { rank: effectiveRank, ranked: true, competitors: competitors.filter(c => c.rank < effectiveRank) };
                 }
             }
 
@@ -394,14 +396,14 @@ export async function checkRankAtPoint({
             if (card.jslog && targetIds.cid) {
                 const m = card.jslog.match(/\b(\d{15,20})\b/);
                 if (m && m[1] === targetIds.cid) {
-                    return { rank: effectiveRank, ranked: true, top5 };
+                    return { rank: effectiveRank, ranked: true, competitors: competitors.filter(c => c.rank < effectiveRank) };
                 }
             }
         }
 
         // Seen enough results without a match — stop
         if (effectiveRank >= maxRankToShow) {
-            return { rank: null, ranked: false, top5 };
+            return { rank: null, ranked: false, competitors };
         }
 
         // ── Smart wait: exit as soon as new cards appear (max SCROLL_WAIT_MAX ms) ──
@@ -424,5 +426,5 @@ export async function checkRankAtPoint({
         prevTotalCards = totalCards;
     }
 
-    return { rank: null, ranked: false, top5 };
+    return { rank: null, ranked: false, competitors };
 }

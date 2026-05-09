@@ -252,7 +252,7 @@ function makeRequestHandler({ jitterMs, passLabel }) {
             quadrant:   point.quadrant,
             rank:       result.rank,
             ranked:     result.ranked,
-            top5:       result.top5 || [],
+            competitors: result.competitors || [],
             ...(result.error ? { error: result.error } : {}),
         };
 
@@ -279,7 +279,7 @@ function makeFailedHandler({ passLabel, keepExisting }) {
             row: point.row, col: point.col,
             lat: point.lat, lng: point.lng,
             quadrant: point.quadrant,
-            rank: null, ranked: false, error: 'request_failed', top5: [],
+            rank: null, ranked: false, error: 'request_failed', competitors: [],
         };
     };
 }
