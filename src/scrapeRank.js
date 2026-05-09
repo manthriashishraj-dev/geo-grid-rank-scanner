@@ -272,22 +272,21 @@ export async function checkRankAtPoint({
             }
 
             const cards = rawCards.map((card) => {
-                // data-cid — check card + all descendants
+                // ── CID ──────────────────────────────────────────────────────────
                 let dataCid = card.getAttribute('data-cid');
                 if (!dataCid) {
                     dataCid = card.querySelector('[data-cid]')?.getAttribute('data-cid') ?? null;
                 }
                 if (dataCid && !/^\d+$/.test(dataCid)) dataCid = null;
 
-                // Only count fully-resolved HTTP hrefs.
-                // Google lazy-loads result cards with empty href="" initially.
+                // ── hrefs (fully-resolved only) ───────────────────────────────────
                 const hrefs = Array.from(card.querySelectorAll('a[href]'))
                     .map(a => a.href)
                     .filter(h => h && /^https?:\/\//.test(h) && !/[/#]$/.test(h));
 
                 const jslog = card.getAttribute('jslog') ?? null;
 
-                // Business name — used for top-5 competitor display
+                // ── Business name ─────────────────────────────────────────────────
                 let name = null;
                 const nameEl = card.querySelector('.fontHeadlineSmall')
                     || card.querySelector('h1')
@@ -302,7 +301,87 @@ export async function checkRankAtPoint({
                     if (lbl && lbl.length > 2 && lbl.length < 100) name = lbl.trim();
                 }
 
-                return { dataCid, hrefs, jslog, name };
+                // ── All spans for field extraction ────────────────────────────────
+                const allSpans = Array.from(card.querySelectorAll('span'));
+
+                // ── Rating (1.0–5.0) ──────────────────────────────────────────────
+                let rating = null;
+                const ratingAriaEl = card.querySelector('[aria-label*="stars"], [aria-label*="star"]');
+                if (ratingAriaEl) {
+                    const m = (ratingAriaEl.getAttribute('aria-label') || '').match(/(\d+\.?\d*)/);
+                    if (m) rating = parseFloat(m[1]);
+                }
+                if (!rating) {
+                    const rText = allSpans.map(s => (s.textContent || '').trim())
+                        .find(t => /^[1-5][.,]\d$/.test(t));
+                    if (rText) rating = parseFloat(rText.replace(',', '.'));
+                }
+
+                // ── Review count ──────────────────────────────────────────────────
+                let reviewCount = null;
+                const reviewAriaEl = card.querySelector('[aria-label*="review"]');
+                if (reviewAriaEl) {
+                    const m = (reviewAriaEl.getAttribute('aria-label') || '').match(/(\d[\d,]*)/);
+                    if (m) reviewCount = parseInt(m[1].replace(/,/g, ''), 10);
+                }
+                if (!reviewCount) {
+                    const rct = allSpans.map(s => (s.textContent || '').trim())
+                        .find(t => /^\([\d,\.]+\)$/.test(t));
+                    if (rct) reviewCount = parseInt(rct.replace(/[(),\.]/g, ''), 10);
+                }
+
+                // ── Category (business type) ──────────────────────────────────────
+                // Short text that is NOT name, NOT numeric, NOT price, NOT status
+                let category = null;
+                const catCandidates = allSpans
+                    .map(s => (s.textContent || '').trim())
+                    .filter(t => t && t.length > 2 && t.length < 60
+                              && t !== name
+                              && !/^\d/.test(t)
+                              && !/[₹$€£¥]/.test(t)
+                              && !/^\(/.test(t)
+                              && !/^(open|close|closes|opens|km|mi|sponsored|ad$)/i.test(t)
+                              && !/^\d+[.,]\d$/.test(t));
+                if (catCandidates.length) category = catCandidates[0];
+
+                // ── Address snippet ───────────────────────────────────────────────
+                let address = null;
+                for (const s of allSpans) {
+                    const t = (s.textContent || '').trim();
+                    if (t && t.includes(',') && t.length > 5 && t.length < 120
+                        && !/^[\d.]+$/.test(t) && !t.startsWith('(') && !t.includes('http')) {
+                        address = t;
+                        break;
+                    }
+                }
+
+                // ── Price level (₹ / $$ etc.) ─────────────────────────────────────
+                let priceLevel = null;
+                for (const s of allSpans) {
+                    const t = (s.textContent || '').trim().replace(/[·\s]/g, '');
+                    if (t && /^[₹$€£¥]{1,4}$/.test(t)) { priceLevel = t; break; }
+                }
+
+                // ── Open/Closed status ────────────────────────────────────────────
+                let openStatus = null;
+                for (const s of allSpans) {
+                    const t = (s.textContent || '').trim();
+                    if (/(open now|closed|closes|opens at|open 24)/i.test(t) && t.length < 50) {
+                        openStatus = t; break;
+                    }
+                }
+
+                // ── Sponsored / Ad flag ───────────────────────────────────────────
+                const isSponsored = !!(
+                    card.querySelector('[data-is-ad="true"]') ||
+                    card.querySelector('[aria-label*="Sponsored"]') ||
+                    allSpans.some(s => /^(Sponsored|Ad)$/i.test((s.textContent || '').trim()))
+                );
+
+                // ── Website URL (non-Google link) ─────────────────────────────────
+                const websiteUrl = hrefs.find(h => !h.includes('google.') && !h.includes('goo.gl')) || null;
+
+                return { dataCid, hrefs, jslog, name, rating, reviewCount, category, address, priceLevel, openStatus, isSponsored, websiteUrl };
             });
 
             // ── Scroll to trigger next batch of lazy-loaded results ────────────
@@ -362,12 +441,28 @@ export async function checkRankAtPoint({
             // We add every named card here; when we find the target at rank N,
             // we return only the slice where rank < N (all businesses above it).
             if (card.name) {
-                // Pick best Maps URL: prefer /maps/place/ link, fall back to any google.com/maps link
                 const mapsUrl = card.hrefs.find(h => h.includes('/maps/place/'))
                              || card.hrefs.find(h => h.includes('google.com/maps'))
                              || card.hrefs[0]
                              || null;
-                competitors.push({ rank: effectiveRank, name: card.name, cid: card.dataCid || null, mapsUrl });
+                // Extract placeId + hexId from the Maps URL at zero extra cost
+                const urlIds = mapsUrl ? extractIdsFromUrl(mapsUrl) : {};
+                competitors.push({
+                    rank:        effectiveRank,
+                    name:        card.name,
+                    cid:         card.dataCid || urlIds.cid || null,
+                    placeId:     urlIds.placeId || null,
+                    hexId:       urlIds.hexId   || null,
+                    mapsUrl,
+                    websiteUrl:  card.websiteUrl  || null,
+                    rating:      card.rating      ?? null,
+                    reviewCount: card.reviewCount ?? null,
+                    category:    card.category    || null,
+                    address:     card.address     || null,
+                    priceLevel:  card.priceLevel  || null,
+                    openStatus:  card.openStatus  || null,
+                    isSponsored: card.isSponsored ?? false,
+                });
             }
 
             if (effectiveRank > maxRankToShow) {
