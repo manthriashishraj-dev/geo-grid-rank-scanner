@@ -17,16 +17,22 @@
  *    not-ranked result, not a retryable error
  *  - Inner retry: if feed is missing, waits and retries once before giving up
  *  - Multiple feed selectors: handles different Google Maps layout variants
+ *
+ * Performance optimisations (v1.0.31):
+ *  - MAX_SCROLL_ROUNDS reduced 10 → 4  (covers top-20 results; loop exits early on plateau)
+ *  - 3 evaluate() calls per scroll round → 1  (extract + scroll merged; count inferred from array length)
+ *  - Fixed 1500ms sleep replaced with page.waitForFunction (exits as soon as new cards appear, max 1s)
+ *  - Fixed post-nav sleep 600→200ms, post-feed sleep 800→300ms
  */
 
 import { sleep } from 'crawlee';
 import { idsMatch } from './extractPlaceId.js';
 import { buildGridPointUrl } from './generateGrid.js';
 
-const SCROLL_PAUSE_MS    = 1500;
-const CARD_WAIT_MS       = 10000;
-const MAX_SCROLL_ROUNDS  = 10;
-const NAV_TIMEOUT_MS     = 45000;
+const CARD_WAIT_MS      = 10000;
+const MAX_SCROLL_ROUNDS = 4;      // 4 scrolls covers ~28 results (well past maxRankToShow=20)
+const NAV_TIMEOUT_MS    = 45000;
+const SCROLL_WAIT_MAX   = 1000;   // waitForFunction timeout per scroll round
 
 // ─── URL ID extractor (Node.js side) ─────────────────────────────────────────
 
@@ -120,8 +126,11 @@ async function detectPageState(page) {
 // ─── Consent bypass ───────────────────────────────────────────────────────────
 
 async function bypassConsent(page, originalUrl) {
-    // Try clicking an accept button
+    // Try clicking an accept button.
+    // IMPORTANT: register waitForNavigation BEFORE the click evaluate() to avoid
+    // a race condition where navigation fires before the listener is set up.
     try {
+        const navPromise = page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
         const accepted = await page.evaluate(() => {
             const btns = Array.from(document.querySelectorAll('button, [role="button"], a'));
             const acceptBtn = btns.find(b => {
@@ -132,9 +141,7 @@ async function bypassConsent(page, originalUrl) {
             if (firstVisible) { firstVisible.click(); return true; }
             return false;
         });
-        if (accepted) {
-            await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
-        }
+        if (accepted) await navPromise;
     } catch { /* ignore */ }
 
     // If still on consent page, navigate directly to the target URL
@@ -179,7 +186,7 @@ async function waitForFeed(page) {
  * @param {import('./extractPlaceId.js').GmbIds} params.targetIds
  * @param {number}  [params.maxRankToShow]
  * @param {string}  [params.language]
- * @returns {Promise<{rank: number|null, ranked: boolean, error?: string}>}
+ * @returns {Promise<{rank: number|null, ranked: boolean, error?: string, top5: Array}>}
  */
 export async function checkRankAtPoint({
     page,
@@ -201,7 +208,7 @@ export async function checkRankAtPoint({
         // Timeout or navigation error — fall through and try to scan whatever loaded
     }
 
-    await sleep(600);
+    await sleep(200); // reduced from 600ms — just enough for initial DOM paint
 
     // ── Page state check ──────────────────────────────────────────────────────
     let state = await detectPageState(page);
@@ -209,152 +216,99 @@ export async function checkRankAtPoint({
     // Handle consent / redirect
     if (state === 'consent') {
         await bypassConsent(page, url);
-        await sleep(1500);
+        await sleep(800); // reduced from 1500ms
         state = await detectPageState(page);
-        // If still consent after bypass attempt → retryable error
         if (state === 'consent') {
-            return { rank: null, ranked: false, error: 'consent_bypass_failed' };
+            return { rank: null, ranked: false, error: 'consent_bypass_failed', top5: [] };
         }
     }
 
     // Captcha → retryable (different proxy IP on retry)
     if (state === 'captcha') {
-        return { rank: null, ranked: false, error: 'captcha' };
+        return { rank: null, ranked: false, error: 'captcha', top5: [] };
     }
 
     // Legitimate "no results in this area" → clean not-ranked, not an error
     if (state === 'no_results') {
-        return { rank: null, ranked: false };
+        return { rank: null, ranked: false, top5: [] };
     }
 
     // ── Wait for feed ─────────────────────────────────────────────────────────
     const feedReady = await waitForFeed(page);
 
     if (!feedReady) {
-        // One more page state check — maybe it resolved to no_results while we waited
         const finalState = await detectPageState(page);
-        if (finalState === 'no_results') return { rank: null, ranked: false };
-        if (finalState === 'consent')    return { rank: null, ranked: false, error: 'consent_bypass_failed' };
-        if (finalState === 'captcha')    return { rank: null, ranked: false, error: 'captcha' };
-        return { rank: null, ranked: false, error: 'no_feed' };
+        if (finalState === 'no_results') return { rank: null, ranked: false, top5: [] };
+        if (finalState === 'consent')    return { rank: null, ranked: false, error: 'consent_bypass_failed', top5: [] };
+        if (finalState === 'captcha')    return { rank: null, ranked: false, error: 'captcha', top5: [] };
+        return { rank: null, ranked: false, error: 'no_feed', top5: [] };
     }
 
-    await sleep(800);
+    await sleep(300); // reduced from 800ms — feed selector confirmed present
 
     // ── Rank-check loop ───────────────────────────────────────────────────────
     //
-    // Strategy: on EVERY scroll round, re-scan ALL cards from scratch.
-    // This correctly handles Google Maps' lazy-loading pattern where cards
-    // are rendered in the DOM with empty hrefs initially, and get their hrefs
-    // populated only when scrolled into view.
+    // Each iteration does ONE page.evaluate() that:
+    //   1. Extracts all current cards (dataCid, hrefs, jslog, name)
+    //   2. Triggers a scroll to load the next batch
+    //   3. Returns the current card count (so we can detect plateau without a 2nd call)
+    //
+    // After the evaluate, page.waitForFunction() waits until new cards appear
+    // (or gives up after SCROLL_WAIT_MAX ms) — no blind fixed sleep.
     //
     let prevTotalCards = 0;
+    let top5 = [];
 
-    for (let scroll = 0; scroll < MAX_SCROLL_ROUNDS; scroll++) {
+    for (let round = 0; round < MAX_SCROLL_ROUNDS; round++) {
 
+        // ── Single evaluate: extract + scroll ─────────────────────────────────
         const extracted = await page.evaluate(() => {
             const feed = document.querySelector('[role="feed"]');
-            if (!feed) return { feedExists: false, cards: [] };
+            if (!feed) return { feedExists: false, cards: [], totalCards: 0 };
 
             let rawCards = Array.from(feed.querySelectorAll(':scope > div'));
             if (rawCards.length === 0) {
                 rawCards = Array.from(document.querySelectorAll('[role="article"]'));
             }
 
-            return {
-                feedExists: true,
-                cards: rawCards.map((card) => {
-                    // data-cid — check card + all descendants
-                    let dataCid = card.getAttribute('data-cid');
-                    if (!dataCid) {
-                        dataCid = card.querySelector('[data-cid]')?.getAttribute('data-cid') ?? null;
-                    }
-                    if (dataCid && !/^\d+$/.test(dataCid)) dataCid = null;
-
-                    // Only count fully-resolved HTTP hrefs.
-                    // Google lazy-loads result cards with empty href="" initially;
-                    // element.href resolves to the page URL with fragment, e.g.
-                    // "https://maps.google.com/maps/search/...#" — filter those out.
-                    const hrefs = Array.from(card.querySelectorAll('a[href]'))
-                        .map(a => a.href)
-                        .filter(h => h && /^https?:\/\//.test(h) && !/[/#]$/.test(h));
-
-                    const jslog = card.getAttribute('jslog') ?? null;
-
-                    return { dataCid, hrefs, jslog };
-                }),
-            };
-        });
-
-        if (!extracted.feedExists && scroll === 0) {
-            // Feed disappeared — re-check state
-            const s = await detectPageState(page);
-            if (s === 'no_results') return { rank: null, ranked: false };
-            return { rank: null, ranked: false, error: 'feed_lost' };
-        }
-
-        const { cards } = extracted;
-
-        // Full scan of ALL cards this round (re-scan from 0 every time).
-        let effectiveRank = 0;
-
-        for (const card of cards) {
-            const isResultCard = card.hrefs.length > 0 || !!card.dataCid;
-            if (!isResultCard) continue;
-
-            effectiveRank++;
-
-            if (effectiveRank > maxRankToShow) {
-                return { rank: null, ranked: false };
-            }
-
-            // 1 ▸ data-cid direct match
-            if (card.dataCid) {
-                if (targetIds.cid && card.dataCid === targetIds.cid) {
-                    return { rank: effectiveRank, ranked: true };
+            const cards = rawCards.map((card) => {
+                // data-cid — check card + all descendants
+                let dataCid = card.getAttribute('data-cid');
+                if (!dataCid) {
+                    dataCid = card.querySelector('[data-cid]')?.getAttribute('data-cid') ?? null;
                 }
-                if (targetIds.hexId) {
-                    try {
-                        if (card.dataCid === BigInt(targetIds.hexId.split(':')[1]).toString()) {
-                            return { rank: effectiveRank, ranked: true };
-                        }
-                    } catch { /* malformed */ }
+                if (dataCid && !/^\d+$/.test(dataCid)) dataCid = null;
+
+                // Only count fully-resolved HTTP hrefs.
+                // Google lazy-loads result cards with empty href="" initially.
+                const hrefs = Array.from(card.querySelectorAll('a[href]'))
+                    .map(a => a.href)
+                    .filter(h => h && /^https?:\/\//.test(h) && !/[/#]$/.test(h));
+
+                const jslog = card.getAttribute('jslog') ?? null;
+
+                // Business name — used for top-5 competitor display
+                let name = null;
+                const nameEl = card.querySelector('.fontHeadlineSmall')
+                    || card.querySelector('h1')
+                    || card.querySelector('h2')
+                    || card.querySelector('h3');
+                if (nameEl) {
+                    name = (nameEl.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 80);
                 }
-            }
-
-            // 2 ▸ Scan all hrefs for any matching ID format
-            for (const href of card.hrefs) {
-                const cardIds = extractIdsFromUrl(href);
-                if (!cardIds.placeId && !cardIds.hexId && !cardIds.cid) continue;
-                if (idsMatch(targetIds, cardIds)) {
-                    return { rank: effectiveRank, ranked: true };
+                if (!name) {
+                    const ariaEl = card.querySelector('[aria-label]') || card;
+                    const lbl = ariaEl.getAttribute('aria-label') || '';
+                    if (lbl && lbl.length > 2 && lbl.length < 100) name = lbl.trim();
                 }
-            }
 
-            // 3 ▸ jslog: Google sometimes embeds CID here as a 15-20-digit number
-            if (card.jslog && targetIds.cid) {
-                const m = card.jslog.match(/\b(\d{15,20})\b/);
-                if (m && m[1] === targetIds.cid) {
-                    return { rank: effectiveRank, ranked: true };
-                }
-            }
-        }
+                return { dataCid, hrefs, jslog, name };
+            });
 
-        // Not found yet — check if we've seen enough results
-        if (effectiveRank >= maxRankToShow) {
-            return { rank: null, ranked: false };
-        }
-
-        const currentTotalCards = cards.length;
-
-        // Scroll to load more results.
-        await page.evaluate(() => {
-            const feed = document.querySelector('[role="feed"]');
-            if (!feed) return;
-
+            // ── Scroll to trigger next batch of lazy-loaded results ────────────
+            // (runs in the same evaluate — saves a round-trip)
             let scrolled = false;
 
-            // 1. Try the feed element itself first (most common in Maps)
             const feedStyle = window.getComputedStyle(feed);
             if (/auto|scroll/.test(feedStyle.overflow + feedStyle.overflowY)
                     && feed.scrollHeight > feed.clientHeight) {
@@ -362,7 +316,6 @@ export async function checkRankAtPoint({
                 scrolled = true;
             }
 
-            // 2. If feed not scrollable, walk up to find the scrollable ancestor
             if (!scrolled) {
                 let el = feed.parentElement;
                 while (el && el !== document.body) {
@@ -376,22 +329,100 @@ export async function checkRankAtPoint({
                 }
             }
 
-            // 3. Always scrollIntoView the last child — triggers the FIRST lazy load
+            // Always scrollIntoView last child — ensures the first lazy load triggers
             const lastChild = feed.lastElementChild;
             if (lastChild) lastChild.scrollIntoView({ block: 'end' });
-        });
-        await sleep(SCROLL_PAUSE_MS);
 
-        const newTotalCards = await page.evaluate(() => {
-            const feed = document.querySelector('[role="feed"]');
-            if (feed) return feed.querySelectorAll(':scope > div').length;
-            return document.querySelectorAll('[role="article"]').length;
+            return { feedExists: true, cards, totalCards: rawCards.length };
         });
 
-        // Stop scrolling if the feed has stopped growing
-        if (newTotalCards <= prevTotalCards && scroll > 0) break;
-        prevTotalCards = newTotalCards;
+        if (!extracted.feedExists && round === 0) {
+            const s = await detectPageState(page);
+            if (s === 'no_results') return { rank: null, ranked: false, top5: [] };
+            return { rank: null, ranked: false, error: 'feed_lost', top5: [] };
+        }
+
+        const { cards, totalCards } = extracted;
+
+        // ── Match check (Node.js side) ────────────────────────────────────────
+        let effectiveRank = 0;
+
+        for (const card of cards) {
+            // A real business card has at least one resolved href OR a data-cid.
+            // Separators and spacers have neither — they're correctly skipped.
+            // We keep this simple: don't require card.name because the CSS class
+            // Google uses for business names changes periodically; a broken selector
+            // would make card.name null for ALL cards → everything looks not-ranked.
+            const isResultCard = card.hrefs.length > 0 || !!card.dataCid;
+            if (!isResultCard) continue;
+
+            effectiveRank++;
+
+            // Collect top-5 for competitor intelligence
+            if (top5.length < 5 && card.name) {
+                top5.push({ rank: effectiveRank, name: card.name, cid: card.dataCid || null });
+            }
+
+            if (effectiveRank > maxRankToShow) {
+                return { rank: null, ranked: false, top5 };
+            }
+
+            // 1 ▸ data-cid direct match
+            if (card.dataCid) {
+                if (targetIds.cid && card.dataCid === targetIds.cid) {
+                    return { rank: effectiveRank, ranked: true, top5 };
+                }
+                if (targetIds.hexId) {
+                    try {
+                        if (card.dataCid === BigInt(targetIds.hexId.split(':')[1]).toString()) {
+                            return { rank: effectiveRank, ranked: true, top5 };
+                        }
+                    } catch { /* malformed */ }
+                }
+            }
+
+            // 2 ▸ Scan all hrefs for any matching ID format
+            for (const href of card.hrefs) {
+                const cardIds = extractIdsFromUrl(href);
+                if (!cardIds.placeId && !cardIds.hexId && !cardIds.cid) continue;
+                if (idsMatch(targetIds, cardIds)) {
+                    return { rank: effectiveRank, ranked: true, top5 };
+                }
+            }
+
+            // 3 ▸ jslog: Google sometimes embeds CID here as a 15-20-digit number
+            if (card.jslog && targetIds.cid) {
+                const m = card.jslog.match(/\b(\d{15,20})\b/);
+                if (m && m[1] === targetIds.cid) {
+                    return { rank: effectiveRank, ranked: true, top5 };
+                }
+            }
+        }
+
+        // Seen enough results without a match — stop
+        if (effectiveRank >= maxRankToShow) {
+            return { rank: null, ranked: false, top5 };
+        }
+
+        // ── Smart wait: exit as soon as new cards appear (max SCROLL_WAIT_MAX ms) ──
+        // This replaces the old fixed sleep(1500ms). If cards load in 300ms we move
+        // immediately; if the feed is exhausted we exit after 1 second.
+        await page.waitForFunction(
+            (expectedCount) => {
+                const feed = document.querySelector('[role="feed"]');
+                const n = feed
+                    ? feed.querySelectorAll(':scope > div').length
+                    : document.querySelectorAll('[role="article"]').length;
+                return n > expectedCount;
+            },
+            totalCards,
+            { timeout: SCROLL_WAIT_MAX }
+        ).catch(() => {}); // timeout = no new cards = plateau; loop handles it
+
+        // ── Plateau detection: stop if feed didn't grow ───────────────────────
+        if (totalCards <= prevTotalCards && round > 0) break;
+        prevTotalCards = totalCards;
     }
 
-    return { rank: null, ranked: false };
+    return { rank: null, ranked: false, top5 };
 }

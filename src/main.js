@@ -4,10 +4,12 @@
  * Apify actor entry point. Orchestrates:
  *  1. Input validation — requires at least one hard unique ID
  *  2. Normalise target IDs (googleMapsUrl | placeId | cid | hexId)
- *  3. Grid point generation
- *  4. Parallel rank scraping at each grid point (10 concurrent tabs)
- *  5. Summary computation (visibility score, quadrant averages)
- *  6. Dataset output
+ *  3. Auto-extract center coordinates from Google Maps URL (if not provided manually)
+ *  4. Grid point generation
+ *  5. Parallel rank scraping at each grid point via crawler factory
+ *  6. Second-pass retry for any errored points (lower concurrency)
+ *  7. Summary computation (visibility score, quadrant averages)
+ *  8. Dataset output
  *
  * No name-based resolution. All matching uses Google-native unique IDs only:
  *   ChIJ Place ID, hex-pair, or CID (numeric).
@@ -39,18 +41,16 @@ const {
     maxRankToShow      = 20,
     language           = 'en',
     // proxyCountry: ISO-3166-1 alpha-2 country code for residential proxy routing.
-    // CRITICAL for accurate results — proxies must be in the SAME COUNTRY as your
-    // target audience. Using UK/US proxies for India shows wrong/different results.
-    // Example: "IN" for India, "US" for USA, "GB" for UK.
-    proxyCountry       = null,
+    // "IN" is the default — Indian residential IPs are required for accurate Indian results.
+    // Change to "US", "GB", "AU" etc. only if scanning a different country's market.
+    proxyCountry       = 'IN',
     proxyConfiguration = { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] },
+    saveScreenshots    = true,
 } = input;
 
 // ─── Validate ─────────────────────────────────────────────────────────────────
 
-if (!keyword)   throw new Error('"keyword" is required (e.g. "Dental clinic")');
-if (!centerLat) throw new Error('"centerLat" is required');
-if (!centerLng) throw new Error('"centerLng" is required');
+if (!keyword) throw new Error('"keyword" is required (e.g. "Dental clinic")');
 if (!googleMapsUrl && !placeId && !cid && !hexId) {
     throw new Error(
         'Provide at least one unique identifier for the target business:\n' +
@@ -61,15 +61,49 @@ if (!googleMapsUrl && !placeId && !cid && !hexId) {
     );
 }
 
+// ─── Auto-extract center coordinates from Google Maps URL ─────────────────────
+// If centerLat/centerLng weren't provided manually, extract them from the URL.
+// Full Maps URL contains /@lat,lng,zoom — short URLs (maps.app.goo.gl) are
+// followed via a HEAD redirect to get the final URL first.
+
+let resolvedLat = centerLat || null;
+let resolvedLng = centerLng || null;
+
+if ((!resolvedLat || !resolvedLng) && googleMapsUrl) {
+    const directMatch = googleMapsUrl.match(/@(-?\d+\.?\d*),(-?\d+\.?\d*),/);
+    if (directMatch) {
+        resolvedLat = resolvedLat || parseFloat(directMatch[1]);
+        resolvedLng = resolvedLng || parseFloat(directMatch[2]);
+        log.info(`Auto-extracted center from URL: ${resolvedLat}, ${resolvedLng}`);
+    } else {
+        try {
+            const resp = await fetch(googleMapsUrl, { method: 'HEAD', redirect: 'follow' });
+            const finalUrl = resp.url;
+            const redirectMatch = finalUrl.match(/@(-?\d+\.?\d*),(-?\d+\.?\d*),/);
+            if (redirectMatch) {
+                resolvedLat = resolvedLat || parseFloat(redirectMatch[1]);
+                resolvedLng = resolvedLng || parseFloat(redirectMatch[2]);
+                log.info(`Auto-extracted center from redirect URL: ${resolvedLat}, ${resolvedLng}`);
+            }
+        } catch (e) {
+            log.warning(`Could not follow URL redirect for coordinate extraction: ${e.message}`);
+        }
+    }
+}
+
+if (!resolvedLat || !resolvedLng) {
+    throw new Error(
+        '"centerLat" and "centerLng" are required.\n' +
+        'Either enter them manually, or paste a full Google Maps URL that contains\n' +
+        'coordinates in its path (e.g. /@17.38,78.48,14z).'
+    );
+}
+
 // ─── Normalise target IDs ─────────────────────────────────────────────────────
-// Derives all available ID formats from whatever the user provided.
-// Cross-format bridge: CID = decimal of hex-pair second part, so
-// providing any one format lets us match against any other format in results.
 
 const targetIds = normaliseTargetIds({ googleMapsUrl, placeId, cid, hexId });
 
 // Resolve display name (cosmetic only — no matching logic depends on this)
-// Priority: explicit businessName input → extracted from googleMapsUrl → null
 let displayName = inputBusinessName || null;
 if (!displayName && googleMapsUrl) {
     const m = googleMapsUrl.match(/maps\/place\/([^/@]+)/);
@@ -77,30 +111,37 @@ if (!displayName && googleMapsUrl) {
 }
 
 log.info('=== Geo-Grid Rank Scanner ===');
-log.info(`Keyword:   "${keyword}"`);
-log.info(`Center:    ${centerLat}, ${centerLng}`);
-log.info(`Grid:      ${gridSize}×${gridSize} = ${gridSize * gridSize} points @ ${gridSpacingMeters}m`);
+log.info(`Keyword:    "${keyword}"`);
+log.info(`Center:     ${resolvedLat}, ${resolvedLng}`);
+
+// Warn if coordinates were auto-extracted from URL — they may be map-view centre,
+// not the exact business pin. User should verify or enter coordinates manually.
+if (!centerLat && !centerLng && googleMapsUrl) {
+    log.warning(
+        '⚠️  centerLat/centerLng were auto-extracted from the Google Maps URL.\n' +
+        '   The /@lat,lng in a Maps URL is the MAP VIEW centre, not always the business pin.\n' +
+        '   If you zoomed out before copying the URL the grid could be offset by 200–500m.\n' +
+        '   For maximum accuracy: right-click the business pin → "What\'s here?" → copy those coords.'
+    );
+}
+log.info(`Grid:       ${gridSize}×${gridSize} = ${gridSize * gridSize} points @ ${gridSpacingMeters}m`);
 log.info(`Target IDs: placeId=${targetIds.placeId || '-'} | cid=${targetIds.cid || '-'} | hexId=${targetIds.hexId || '-'}`);
 
 // ─── Proxy ────────────────────────────────────────────────────────────────────
 
-// If proxyCountry is set, inject it into the proxy config so residential proxies
-// route through that country. This is essential for getting local-accurate results.
 const resolvedProxyConfig = proxyCountry
     ? { ...proxyConfiguration, countryCode: proxyCountry }
     : proxyConfiguration;
 
-if (proxyCountry) {
-    log.info(`Proxy country: ${proxyCountry} (residential IPs from that country)`);
-}
+log.info(`Proxy country: ${proxyCountry} — residential IPs routed through this country`);
 
 const proxy = await Actor.createProxyConfiguration(resolvedProxyConfig);
 
 // ─── Generate grid points ─────────────────────────────────────────────────────
 
 const gridPoints = generateGridPoints({
-    centerLat,
-    centerLng,
+    centerLat:    resolvedLat,
+    centerLng:    resolvedLng,
     spacingMeters: gridSpacingMeters,
     gridSize,
 });
@@ -110,80 +151,95 @@ log.info(`Generated ${gridPoints.length} grid points.`);
 // gridResults[pointIndex] populated by crawler handlers
 const gridResults = new Array(gridPoints.length).fill(null);
 
-// ─── Build request queue ──────────────────────────────────────────────────────
+// ─── Shared crawler config ────────────────────────────────────────────────────
+// Shared between primary and second-pass crawlers to avoid duplication.
 
-const requests = gridPoints.map((pt) => ({
-    url: `https://www.google.com/maps/search/${encodeURIComponent(keyword)}/@${pt.lat},${pt.lng},14z?hl=${language}`,
-    label: 'GRID_POINT',
-    userData: { point: pt, keyword, language },
-}));
+const RETRYABLE_ERRORS = ['no_feed', 'nav_timeout', 'feed_lost', 'consent_bypass_failed', 'captcha'];
 
-// ─── Crawler ──────────────────────────────────────────────────────────────────
-
-const crawler = new PlaywrightCrawler({
-    proxyConfiguration: proxy,
-    maxConcurrency: 5,            // lower concurrency = less proxy stress = fewer no_feed errors
-    maxRequestRetries: 2,         // auto-retry nav_timeout / no_feed up to 2 extra times
-    requestHandlerTimeoutSecs: 150,
-    navigationTimeoutSecs: 60,    // prevent Crawlee default (60s) from overriding page.goto timeout
-
-    launchContext: {
-        launchOptions: {
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-blink-features=AutomationControlled',
-                '--lang=en-US',
-            ],
-        },
+const SHARED_LAUNCH_CONTEXT = {
+    launchOptions: {
+        headless: true,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-blink-features=AutomationControlled',
+            '--lang=en-US',
+            // Block all image requests at the Chromium engine level.
+            // Map tiles, business photos, and street view assets are the largest
+            // bandwidth consumers (~35-45% of a Maps page). We never need them for
+            // DOM-based rank scraping. This is NOT page.route() — Chromium simply
+            // never generates these network requests, so Google sees nothing abnormal.
+            '--blink-settings=imagesEnabled=false',
+            // Disable background networking (Safe Browsing, auto-update pings,
+            // metrics beacons). These are invisible background requests we never need.
+            '--disable-background-networking',
+        ],
     },
+};
 
-    preNavigationHooks: [
-        async ({ page }) => {
-            await page.addInitScript(() => {
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            });
-            await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+const SHARED_PRE_NAV_HOOKS = [
+    async ({ page }) => {
+        // Smaller viewport = fewer map tile requests. Combined with imagesEnabled=false
+        // this is belt-and-suspenders — tiles won't load anyway, but smaller DOM layout
+        // also reduces CSS/reflow overhead per page.
+        await page.setViewportSize({ width: 960, height: 600 });
 
-            // Pre-set SOCS cookie to bypass Google's GDPR/EU consent page.
-            // Residential proxies often route through EU/UK IPs which trigger consent.google.com.
-            // This cookie signals that the user has already accepted and skips the redirect.
-            try {
-                await page.context().addCookies([{
-                    name:   'SOCS',
-                    value:  'CAISHAgBEhJnd3NfMjAyMzA4MDItMF9SQzEaAmVuIAEaBgiAsLWmBg',
-                    domain: '.google.com',
-                    path:   '/',
-                }]);
-            } catch { /* context may not be ready */ }
-        },
-    ],
+        await page.addInitScript(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        });
+        await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+        // Pre-set SOCS cookie to bypass Google's GDPR/EU consent page.
+        // Residential proxies often route through EU/UK IPs which trigger consent.google.com.
+        try {
+            await page.context().addCookies([{
+                name:   'SOCS',
+                value:  'CAISHAgBEhJnd3NfMjAyMzA4MDItMF9SQzEaAmVuIAEaBgiAsLWmBg',
+                domain: '.google.com',
+                path:   '/',
+            }]);
+        } catch { /* context may not be ready */ }
 
-    requestHandler: async ({ request, page, log: crawlerLog }) => {
+    },
+];
+
+/**
+ * Build a request handler for a crawler pass.
+ * @param {{ jitterMs: number, passLabel: string }} opts
+ */
+function makeRequestHandler({ jitterMs, passLabel }) {
+    return async ({ request, page, log: crawlerLog }) => {
         const { point } = request.userData;
 
         crawlerLog.info(
-            `[${point.pointIndex + 1}/${gridPoints.length}] ` +
-            `(${point.lat}, ${point.lng}) — ${point.quadrant}`
+            `${passLabel}[${point.pointIndex + 1}/${gridPoints.length}] ` +
+            `(${point.lat.toFixed(5)}, ${point.lng.toFixed(5)}) — ${point.quadrant}`
         );
 
-        await sleep(Math.random() * 400); // small jitter
+        if (jitterMs > 0) await sleep(Math.random() * jitterMs);
 
         const result = await checkRankAtPoint({
             page,
-            keyword: request.userData.keyword,
-            lat:     point.lat,
-            lng:     point.lng,
+            keyword:      request.userData.keyword,
+            lat:          point.lat,
+            lng:          point.lng,
             targetIds,
             maxRankToShow,
-            language: request.userData.language,
+            language:     request.userData.language,
         });
 
-        // Retryable errors: throw so Crawlee's maxRequestRetries kicks in.
-        // Non-retryable (rank found, or clean "not in top N") are stored directly.
-        const RETRYABLE = ['no_feed', 'nav_timeout', 'feed_lost', 'consent_bypass_failed', 'captcha'];
-        if (result.error && RETRYABLE.some(e => result.error.startsWith(e))) {
+        // ── Screenshot (optional verification mode) ───────────────────────────
+        // Captures what the scraper actually saw at this grid point.
+        // Saved to Key-Value Store → visible in Apify console → Storage tab.
+        if (request.userData.saveScreenshots) {
+            try {
+                const rankLabel  = result.ranked ? `rank${result.rank}` : 'unranked';
+                const key = `pt${String(point.pointIndex).padStart(2, '0')}_row${point.row}_col${point.col}_${rankLabel}`;
+                const shot = await page.screenshot({ type: 'jpeg', quality: 70, fullPage: false });
+                await Actor.setValue(key, shot, { contentType: 'image/jpeg' });
+            } catch { /* non-critical — never let a screenshot failure abort the scan */ }
+        }
+
+        if (result.error && RETRYABLE_ERRORS.some(e => result.error.startsWith(e))) {
             throw new Error(`retryable: ${result.error}`);
         }
 
@@ -196,6 +252,7 @@ const crawler = new PlaywrightCrawler({
             quadrant:   point.quadrant,
             rank:       result.rank,
             ranked:     result.ranked,
+            top5:       result.top5 || [],
             ...(result.error ? { error: result.error } : {}),
         };
 
@@ -203,28 +260,69 @@ const crawler = new PlaywrightCrawler({
             ? `  → Rank #${result.rank}`
             : `  → Not in top ${maxRankToShow}`
         );
-    },
+    };
+}
 
-    failedRequestHandler: async ({ request, log: crawlerLog }) => {
-        crawlerLog.error(`Failed: ${request.url}`);
+/**
+ * Build a failed-request handler.
+ * keepExisting=true: only preserve SUCCESSFUL first-pass results — if the first pass
+ * itself errored, the second pass failure should still update the error info.
+ */
+function makeFailedHandler({ passLabel, keepExisting }) {
+    return async ({ request, log: crawlerLog }) => {
+        crawlerLog.error(`${passLabel}Failed: ${request.url}`);
         const { point } = request.userData;
+        const existing = gridResults[point.pointIndex];
+        if (keepExisting && existing && !existing.error) return; // preserve successful first-pass result
         gridResults[point.pointIndex] = {
             pointIndex: point.pointIndex,
             row: point.row, col: point.col,
             lat: point.lat, lng: point.lng,
             quadrant: point.quadrant,
-            rank: null, ranked: false, error: 'request_failed',
+            rank: null, ranked: false, error: 'request_failed', top5: [],
         };
-    },
+    };
+}
+
+/**
+ * Factory: create, load, and run a PlaywrightCrawler then return.
+ */
+async function runCrawler({ requests, concurrency, retries, requestTimeoutSecs, navTimeoutSecs, jitterMs, passLabel }) {
+    const crawler = new PlaywrightCrawler({
+        proxyConfiguration:        proxy,
+        maxConcurrency:            concurrency,
+        maxRequestRetries:         retries,
+        requestHandlerTimeoutSecs: requestTimeoutSecs,
+        navigationTimeoutSecs:     navTimeoutSecs,
+        launchContext:             SHARED_LAUNCH_CONTEXT,
+        preNavigationHooks:        SHARED_PRE_NAV_HOOKS,
+        requestHandler:            makeRequestHandler({ jitterMs, passLabel }),
+        failedRequestHandler:      makeFailedHandler({ passLabel, keepExisting: passLabel !== '' }),
+
+    });
+    await crawler.addRequests(requests);
+    await crawler.run();
+}
+
+// ─── Primary pass ─────────────────────────────────────────────────────────────
+
+const primaryRequests = gridPoints.map((pt) => ({
+    url:      `https://www.google.com/maps/search/${encodeURIComponent(keyword)}/@${pt.lat},${pt.lng},14z?hl=${language}`,
+    label:    'GRID_POINT',
+    userData: { point: pt, keyword, language, saveScreenshots },
+}));
+
+await runCrawler({
+    requests:           primaryRequests,
+    concurrency:        5,
+    retries:            2,
+    requestTimeoutSecs: 150,
+    navTimeoutSecs:     60,
+    jitterMs:           400,
+    passLabel:          '',
 });
 
-await crawler.addRequests(requests);
-await crawler.run();
-
-// ─── Second-pass: retry any still-errored points ──────────────────────────────
-// After the primary crawl (with maxRequestRetries:2), some points may still
-// have error: 'no_feed' | 'request_failed' etc. Run a slower, more patient
-// second pass on just those points (concurrency 2, no concurrency stress).
+// ─── Second pass: retry errored points at lower concurrency ───────────────────
 
 const erroredPoints = gridPoints.filter((pt) => {
     const res = gridResults[pt.pointIndex];
@@ -232,104 +330,28 @@ const erroredPoints = gridPoints.filter((pt) => {
 });
 
 if (erroredPoints.length > 0) {
-    log.info(`Second pass: retrying ${erroredPoints.length} errored points at lower concurrency…`);
-
-    const crawler2 = new PlaywrightCrawler({
-        proxyConfiguration: proxy,
-        maxConcurrency: 2,
-        maxRequestRetries: 1,
-        requestHandlerTimeoutSecs: 180,
-        navigationTimeoutSecs: 75,
-
-        launchContext: {
-            launchOptions: {
-                headless: true,
-                args: [
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-blink-features=AutomationControlled',
-                    '--lang=en-US',
-                ],
-            },
-        },
-
-        preNavigationHooks: [
-            async ({ page }) => {
-                await page.addInitScript(() => {
-                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                });
-                await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
-                try {
-                    await page.context().addCookies([{
-                        name:   'SOCS',
-                        value:  'CAISHAgBEhJnd3NfMjAyMzA4MDItMF9SQzEaAmVuIAEaBgiAsLWmBg',
-                        domain: '.google.com',
-                        path:   '/',
-                    }]);
-                } catch { /* context may not be ready */ }
-            },
-        ],
-
-        requestHandler: async ({ request, page, log: crawlerLog }) => {
-            const { point } = request.userData;
-            crawlerLog.info(`[2nd-pass] (${point.lat}, ${point.lng})`);
-            await sleep(500 + Math.random() * 800);
-
-            const result = await checkRankAtPoint({
-                page,
-                keyword: request.userData.keyword,
-                lat:     point.lat,
-                lng:     point.lng,
-                targetIds,
-                maxRankToShow,
-                language: request.userData.language,
-            });
-
-            const RETRYABLE2 = ['no_feed', 'nav_timeout', 'feed_lost', 'consent_bypass_failed', 'captcha'];
-            if (result.error && RETRYABLE2.some(e => result.error.startsWith(e))) {
-                throw new Error(`retryable: ${result.error}`);
-            }
-
-            gridResults[point.pointIndex] = {
-                pointIndex: point.pointIndex,
-                row: point.row, col: point.col,
-                lat: point.lat, lng: point.lng,
-                quadrant: point.quadrant,
-                rank: result.rank,
-                ranked: result.ranked,
-                ...(result.error ? { error: result.error } : {}),
-            };
-
-            crawlerLog.info(result.ranked ? `  → Rank #${result.rank}` : `  → Not in top ${maxRankToShow}`);
-        },
-
-        failedRequestHandler: async ({ request, log: crawlerLog }) => {
-            crawlerLog.error(`[2nd-pass] Failed: ${request.url}`);
-            const { point } = request.userData;
-            // Keep whatever was there before (first-pass error) rather than overwriting
-            if (!gridResults[point.pointIndex]) {
-                gridResults[point.pointIndex] = {
-                    pointIndex: point.pointIndex,
-                    row: point.row, col: point.col,
-                    lat: point.lat, lng: point.lng,
-                    quadrant: point.quadrant,
-                    rank: null, ranked: false, error: 'request_failed',
-                };
-            }
-        },
-    });
+    log.info(`Second pass: retrying ${erroredPoints.length} errored point(s) at lower concurrency…`);
 
     const retryRequests = erroredPoints.map((pt) => ({
-        url: `https://www.google.com/maps/search/${encodeURIComponent(keyword)}/@${pt.lat},${pt.lng},14z?hl=${language}`,
-        label: 'GRID_POINT',
-        userData: { point: pt, keyword, language },
+        url:      `https://www.google.com/maps/search/${encodeURIComponent(keyword)}/@${pt.lat},${pt.lng},14z?hl=${language}`,
+        label:    'GRID_POINT',
+        userData: { point: pt, keyword, language, saveScreenshots },
     }));
 
-    await crawler2.addRequests(retryRequests);
-    await crawler2.run();
+    await runCrawler({
+        requests:           retryRequests,
+        concurrency:        2,
+        retries:            1,
+        requestTimeoutSecs: 180,
+        navTimeoutSecs:     75,
+        jitterMs:           1300,
+        passLabel:          '[2nd-pass] ',
+    });
 
-    const resolved = erroredPoints.filter((pt) => gridResults[pt.pointIndex] && !gridResults[pt.pointIndex].error);
-    log.info(`Second pass complete. Resolved ${resolved.length}/${erroredPoints.length} previously errored points.`);
+    const resolved = erroredPoints.filter(
+        (pt) => gridResults[pt.pointIndex] && !gridResults[pt.pointIndex].error
+    );
+    log.info(`Second pass complete. Resolved ${resolved.length}/${erroredPoints.length} errored points.`);
 }
 
 // ─── Summary ──────────────────────────────────────────────────────────────────
@@ -348,7 +370,7 @@ const annotatedResults = gridResults.map((pt, i) => {
         ...pt,
         category:    getRankCategory(pt.rank),
         isCenter:    i === centerIndex,
-        displayRank: pt.rank && pt.rank <= 7 ? String(pt.rank) : '8+',
+        displayRank: pt.rank ? String(pt.rank) : `>${maxRankToShow}`,
     };
 }).filter(Boolean);
 
@@ -366,7 +388,9 @@ function avg(arr) {
 const quadrantRanks = { NW: [], NE: [], SW: [], SE: [] };
 for (const pt of annotatedResults) {
     if (pt.isCenter) continue;
-    quadrantRanks[pt.quadrant].push(pt.rank ?? 20);
+    // Unranked points get maxRankToShow+1 as penalty so they pull the quadrant
+    // average UP (worse), not silently excluded or capped at a wrong constant.
+    quadrantRanks[pt.quadrant].push(pt.rank ?? (maxRankToShow + 1));
 }
 
 const quadrantAvg = {
@@ -390,7 +414,7 @@ const gridMatrix = Array.from({ length: gridSize }, (_, r) =>
         const pt = annotatedResults.find((p) => p.row === r && p.col === c);
         return pt
             ? { row: r, col: c, rank: pt.rank, category: pt.category, displayRank: pt.displayRank, isCenter: pt.isCenter }
-            : { row: r, col: c, rank: null, category: 'INVISIBLE', displayRank: '8+', isCenter: false };
+            : { row: r, col: c, rank: null, category: 'INVISIBLE', displayRank: `>${maxRankToShow}`, isCenter: r === Math.floor(gridSize / 2) && c === Math.floor(gridSize / 2) };
     })
 );
 
@@ -401,10 +425,10 @@ const summary = {
     visibleCount,
     weakCount,
     invisibleCount,
-    avgRank:        avg(allRanks),
-    minRank:        allRanks.length ? Math.min(...allRanks) : null,
-    maxRank:        allRanks.length ? Math.max(...allRanks) : null,
-    top3Count:      allRanks.filter((r) => r <= 3).length,
+    avgRank:     avg(allRanks),
+    minRank:     allRanks.length ? Math.min(...allRanks) : null,
+    maxRank:     allRanks.length ? Math.max(...allRanks) : null,
+    top3Count:   allRanks.filter((r) => r <= 3).length,
     quadrantAvg,
     weakestQuadrant,
 };
@@ -415,8 +439,8 @@ await Actor.pushData({
     keyword,
     businessName:   displayName,
     targetIds,
-    centerLat,
-    centerLng,
+    centerLat:      resolvedLat,
+    centerLng:      resolvedLng,
     gridSize,
     gridSpacingMeters,
     maxRankToShow,

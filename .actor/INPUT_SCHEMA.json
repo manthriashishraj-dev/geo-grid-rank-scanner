@@ -10,6 +10,13 @@
       "editor": "textfield",
       "example": "Dental clinic"
     },
+    "businessName": {
+      "title": "Business Name (display only)",
+      "type": "string",
+      "description": "Optional. The business's display name shown on the heatmap. Auto-extracted from googleMapsUrl if not provided.",
+      "editor": "textfield",
+      "example": "Aishwarya Dental Clinic"
+    },
     "googleMapsUrl": {
       "title": "Google Maps URL (easiest — paste from the GMB listing)",
       "type": "string",
@@ -39,15 +46,15 @@
       "example": "0x3bcb93b35bbe5f61:0x5e8f1e0d4c3a2b1f"
     },
     "centerLat": {
-      "title": "Center Latitude *",
+      "title": "Center Latitude (optional if googleMapsUrl has coordinates)",
       "type": "number",
-      "description": "Latitude of the grid center — the business's coordinates. Copy from Google Maps by right-clicking the pin.",
+      "description": "Latitude of the business pin — NOT the map view centre. For maximum accuracy: right-click the business pin in Google Maps → 'What's here?' → copy the exact lat shown. Auto-extracted from googleMapsUrl if not provided, but the URL's /@lat,lng may be off by 200–500m if you zoomed out before copying.",
       "example": 17.9784
     },
     "centerLng": {
-      "title": "Center Longitude *",
+      "title": "Center Longitude (optional if googleMapsUrl has coordinates)",
       "type": "number",
-      "description": "Longitude of the grid center. Copy from Google Maps by right-clicking the pin.",
+      "description": "Longitude of the business pin. See centerLat instructions above.",
       "example": 79.5965
     },
     "gridSize": {
@@ -85,10 +92,11 @@
       "default": "en"
     },
     "proxyCountry": {
-      "title": "Proxy Country Code (CRITICAL for accuracy)",
+      "title": "Proxy Country Code",
       "type": "string",
-      "description": "ISO-3166 country code to route residential proxies through. MUST match your target market — using the wrong country shows completely different results. E.g. 'IN' for India, 'US' for USA, 'GB' for UK. Leave blank to let Apify pick automatically (not recommended).",
+      "description": "ISO-3166 country code for residential proxy routing. Defaults to 'IN' (India). Google Maps shows completely different local results per country — this MUST match your target market. Change to 'US' for USA, 'GB' for UK, 'AU' for Australia, etc.",
       "editor": "textfield",
+      "default": "IN",
       "example": "IN"
     },
     "proxyConfiguration": {
@@ -100,7 +108,13 @@
         "useApifyProxy": true,
         "apifyProxyGroups": ["RESIDENTIAL"]
       }
+    },
+    "saveScreenshots": {
+      "title": "Save Screenshots (verification mode)",
+      "type": "boolean",
+      "description": "Capture a JPEG screenshot of the Google Maps results page at every grid point. Screenshots are saved to the run's Key-Value Store (Storage tab) — named by point index, row, col and detected rank. Use this to visually verify that the scraper is reading the right results. Adds ~15–25 seconds to total runtime. Leave OFF for regular production scans.",
+      "default": true
     }
   },
-  "required": ["keyword", "centerLat", "centerLng"]
+  "required": ["keyword"]
 }

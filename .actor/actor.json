@@ -4,13 +4,13 @@
   "title": "Geo-Grid Rank Scanner",
   "description": "Checks a Google My Business listing's local search rank across an N×N geographic grid using direct Playwright scraping. No SerpAPI key required.",
   "version": "1.0",
-  "input": "./INPUT_SCHEMA.json",
+  "input": "./input_schema.json",
   "dockerfile": "./Dockerfile",
   "buildTag": "latest",
   "environmentVariables": {},
   "defaultRunOptions": {
     "build": "latest",
-    "timeoutSecs": 3600,
-    "memoryMbytes": 32768
+    "timeoutSecs": 600,
+    "memoryMbytes": 1536
   }
 }

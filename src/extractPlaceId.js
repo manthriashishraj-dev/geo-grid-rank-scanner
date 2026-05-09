@@ -69,43 +69,6 @@ export function extractAllIdsFromUrl(url) {
 }
 
 /**
- * Extract all known GMB unique IDs from a DOM result card (Playwright element).
- * @param {import('playwright').ElementHandle} card
- * @returns {Promise<GmbIds>}
- */
-export async function extractAllIdsFromCard(card) {
-    const result = { placeId: null, hexId: null, cid: null };
-
-    try {
-        // data-cid attribute — Google often puts the numeric CID directly on the card element
-        const dataCid = await card.evaluate((el) => {
-            return el.getAttribute('data-cid')
-                || el.querySelector('[data-cid]')?.getAttribute('data-cid')
-                || null;
-        });
-        if (dataCid && /^\d+$/.test(dataCid)) {
-            result.cid = dataCid;
-        }
-
-        // Anchor href — contains hex-pair and/or ChIJ in the data blob
-        const href = await card.evaluate((el) => {
-            const a = el.querySelector('a[href*="/maps/"]') || el.closest('a[href*="/maps/"]');
-            return a?.href || null;
-        });
-        if (href) {
-            const fromHref = extractAllIdsFromUrl(href);
-            result.placeId = result.placeId || fromHref.placeId;
-            result.hexId   = result.hexId   || fromHref.hexId;
-            result.cid     = result.cid     || fromHref.cid;
-        }
-    } catch {
-        // Card detached from DOM during scroll — return whatever we have
-    }
-
-    return result;
-}
-
-/**
  * Check if a set of target IDs matches a set of card IDs.
  * Returns true if any ID format overlaps between the two objects.
  *
@@ -160,9 +123,12 @@ export function normaliseTargetIds({ googleMapsUrl, placeId, cid, hexId }) {
     // Start from URL if provided — extracts all formats at once
     const fromUrl = googleMapsUrl ? extractAllIdsFromUrl(googleMapsUrl) : {};
 
+    // Normalize hexId to lowercase — card hrefs always produce lowercase hex,
+    // so a user-supplied uppercase hexId would silently fail to match.
+    const rawHexId = hexId || fromUrl.hexId || null;
     const result = {
         placeId: placeId || fromUrl.placeId || null,
-        hexId:   hexId   || fromUrl.hexId   || null,
+        hexId:   rawHexId ? rawHexId.toLowerCase() : null,
         cid:     cid     || fromUrl.cid     || null,
     };
 
