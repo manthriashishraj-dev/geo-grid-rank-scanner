@@ -362,7 +362,12 @@ export async function checkRankAtPoint({
             // We add every named card here; when we find the target at rank N,
             // we return only the slice where rank < N (all businesses above it).
             if (card.name) {
-                competitors.push({ rank: effectiveRank, name: card.name, cid: card.dataCid || null });
+                // Pick best Maps URL: prefer /maps/place/ link, fall back to any google.com/maps link
+                const mapsUrl = card.hrefs.find(h => h.includes('/maps/place/'))
+                             || card.hrefs.find(h => h.includes('google.com/maps'))
+                             || card.hrefs[0]
+                             || null;
+                competitors.push({ rank: effectiveRank, name: card.name, cid: card.dataCid || null, mapsUrl });
             }
 
             if (effectiveRank > maxRankToShow) {
