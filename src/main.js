@@ -45,7 +45,6 @@ const {
     // Change to "US", "GB", "AU" etc. only if scanning a different country's market.
     proxyCountry       = 'IN',
     proxyConfiguration = { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] },
-    saveScreenshots    = true,
 } = input;
 
 // ─── Validate ─────────────────────────────────────────────────────────────────
@@ -227,18 +226,6 @@ function makeRequestHandler({ jitterMs, passLabel }) {
             language:     request.userData.language,
         });
 
-        // ── Screenshot (optional verification mode) ───────────────────────────
-        // Captures what the scraper actually saw at this grid point.
-        // Saved to Key-Value Store → visible in Apify console → Storage tab.
-        if (request.userData.saveScreenshots) {
-            try {
-                const rankLabel  = result.ranked ? `rank${result.rank}` : 'unranked';
-                const key = `pt${String(point.pointIndex).padStart(2, '0')}_row${point.row}_col${point.col}_${rankLabel}`;
-                const shot = await page.screenshot({ type: 'jpeg', quality: 70, fullPage: false });
-                await Actor.setValue(key, shot, { contentType: 'image/jpeg' });
-            } catch { /* non-critical — never let a screenshot failure abort the scan */ }
-        }
-
         if (result.error && RETRYABLE_ERRORS.some(e => result.error.startsWith(e))) {
             throw new Error(`retryable: ${result.error}`);
         }
@@ -309,7 +296,7 @@ async function runCrawler({ requests, concurrency, retries, requestTimeoutSecs, 
 const primaryRequests = gridPoints.map((pt) => ({
     url:      `https://www.google.com/maps/search/${encodeURIComponent(keyword)}/@${pt.lat},${pt.lng},14z?hl=${language}`,
     label:    'GRID_POINT',
-    userData: { point: pt, keyword, language, saveScreenshots },
+    userData: { point: pt, keyword, language },
 }));
 
 await runCrawler({
@@ -335,7 +322,7 @@ if (erroredPoints.length > 0) {
     const retryRequests = erroredPoints.map((pt) => ({
         url:      `https://www.google.com/maps/search/${encodeURIComponent(keyword)}/@${pt.lat},${pt.lng},14z?hl=${language}`,
         label:    'GRID_POINT',
-        userData: { point: pt, keyword, language, saveScreenshots },
+        userData: { point: pt, keyword, language },
     }));
 
     await runCrawler({
