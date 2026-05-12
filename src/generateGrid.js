@@ -59,17 +59,39 @@ export function generateGridPoints({ centerLat, centerLng, spacingMeters, gridSi
 }
 
 /**
+ * Return the optimal Google Maps zoom level for a given grid spacing.
+ *
+ * Zoom controls how tightly Google anchors results to the search location:
+ *   z=16 → ~600m  view radius  (dense city, 300m spacing)
+ *   z=15 → ~1.2km view radius  (standard,   500m spacing)  ← default
+ *   z=14 → ~2.5km view radius  (suburb,    1000m spacing)
+ *   z=13 → ~5km   view radius  (rural,     2000m spacing)
+ *
+ * Using a zoom that is too LOW (e.g. z=14 for 500m spacing) causes Google to
+ * pull in businesses 2-3km away, making the rank data inaccurate for that cell.
+ *
+ * @param {number} spacingMeters
+ * @returns {number}
+ */
+export function getZoomForSpacing(spacingMeters) {
+    if (spacingMeters <= 300)  return 16;
+    if (spacingMeters <= 700)  return 15;
+    if (spacingMeters <= 1500) return 14;
+    return 13;
+}
+
+/**
  * Build a Google Maps search URL that anchors the viewport to a specific lat/lng.
  *
- * @param {string} keyword  e.g. "Dental clinic"
+ * @param {string} keyword       e.g. "Dental clinic"
  * @param {number} lat
  * @param {number} lng
- * @param {string} lang     e.g. "en"
+ * @param {string} lang          e.g. "en"
+ * @param {number} spacingMeters grid spacing — used to compute the correct zoom level
  * @returns {string}
  */
-export function buildGridPointUrl(keyword, lat, lng, lang = 'en') {
-    const q = encodeURIComponent(keyword);
-    // The @lat,lng,14z anchor tells Google Maps which area to show results for.
-    // zoom=14 (≈ neighbourhood level) is what Local Falcon / GMB Master Pro use.
-    return `https://www.google.com/maps/search/${q}/@${lat},${lng},14z?hl=${lang}`;
+export function buildGridPointUrl(keyword, lat, lng, lang = 'en', spacingMeters = 500) {
+    const q    = encodeURIComponent(keyword);
+    const zoom = getZoomForSpacing(spacingMeters);
+    return `https://www.google.com/maps/search/${q}/@${lat},${lng},${zoom}z?hl=${lang}`;
 }

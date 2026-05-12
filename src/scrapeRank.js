@@ -186,6 +186,7 @@ async function waitForFeed(page) {
  * @param {import('./extractPlaceId.js').GmbIds} params.targetIds
  * @param {number}  [params.maxRankToShow]
  * @param {string}  [params.language]
+ * @param {number}  [params.spacingMeters]  grid spacing — passed to buildGridPointUrl for correct zoom
  * @returns {Promise<{rank: number|null, ranked: boolean, error?: string, competitors: Array}>}
  */
 export async function checkRankAtPoint({
@@ -194,10 +195,11 @@ export async function checkRankAtPoint({
     lat,
     lng,
     targetIds,
-    maxRankToShow = 20,
-    language      = 'en',
+    maxRankToShow  = 20,
+    language       = 'en',
+    spacingMeters  = 500,
 }) {
-    const url = buildGridPointUrl(keyword, lat, lng, language);
+    const url = buildGridPointUrl(keyword, lat, lng, language, spacingMeters);
 
     // ── Navigate ──────────────────────────────────────────────────────────────
     // On timeout we don't bail immediately — partial page loads often still
