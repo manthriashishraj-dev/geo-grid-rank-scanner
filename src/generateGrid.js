@@ -59,39 +59,19 @@ export function generateGridPoints({ centerLat, centerLng, spacingMeters, gridSi
 }
 
 /**
- * Return the optimal Google Maps zoom level for a given grid spacing.
+ * Build a Google Maps search URL anchored to a specific lat/lng.
  *
- * Zoom controls how tightly Google anchors results to the search location:
- *   z=16 → ~600m  view radius  (dense city, 300m spacing)
- *   z=15 → ~1.2km view radius  (standard,   500m spacing)  ← default
- *   z=14 → ~2.5km view radius  (suburb,    1000m spacing)
- *   z=13 → ~5km   view radius  (rural,     2000m spacing)
+ * The @lat,lng sets the map view center. The real "I am here" signal is set
+ * separately via page.context().setGeolocation() before navigation — that is
+ * what Google Maps actually uses to rank local results.
  *
- * Using a zoom that is too LOW (e.g. z=14 for 500m spacing) causes Google to
- * pull in businesses 2-3km away, making the rank data inaccurate for that cell.
- *
- * @param {number} spacingMeters
- * @returns {number}
- */
-export function getZoomForSpacing(spacingMeters) {
-    if (spacingMeters <= 300)  return 16;
-    if (spacingMeters <= 700)  return 15;
-    if (spacingMeters <= 1500) return 14;
-    return 13;
-}
-
-/**
- * Build a Google Maps search URL that anchors the viewport to a specific lat/lng.
- *
- * @param {string} keyword       e.g. "Dental clinic"
+ * @param {string} keyword  e.g. "Dental clinic"
  * @param {number} lat
  * @param {number} lng
- * @param {string} lang          e.g. "en"
- * @param {number} spacingMeters grid spacing — used to compute the correct zoom level
+ * @param {string} lang     e.g. "en"
  * @returns {string}
  */
-export function buildGridPointUrl(keyword, lat, lng, lang = 'en', spacingMeters = 500) {
-    const q    = encodeURIComponent(keyword);
-    const zoom = getZoomForSpacing(spacingMeters);
-    return `https://www.google.com/maps/search/${q}/@${lat},${lng},${zoom}z?hl=${lang}`;
+export function buildGridPointUrl(keyword, lat, lng, lang = 'en') {
+    const q = encodeURIComponent(keyword);
+    return `https://www.google.com/maps/search/${q}/@${lat},${lng},15z?hl=${lang}`;
 }

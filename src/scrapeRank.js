@@ -186,7 +186,6 @@ async function waitForFeed(page) {
  * @param {import('./extractPlaceId.js').GmbIds} params.targetIds
  * @param {number}  [params.maxRankToShow]
  * @param {string}  [params.language]
- * @param {number}  [params.spacingMeters]  grid spacing — passed to buildGridPointUrl for correct zoom
  * @returns {Promise<{rank: number|null, ranked: boolean, error?: string, competitors: Array}>}
  */
 export async function checkRankAtPoint({
@@ -195,11 +194,19 @@ export async function checkRankAtPoint({
     lat,
     lng,
     targetIds,
-    maxRankToShow  = 20,
-    language       = 'en',
-    spacingMeters  = 500,
+    maxRankToShow = 20,
+    language      = 'en',
 }) {
-    const url = buildGridPointUrl(keyword, lat, lng, language, spacingMeters);
+    // ── Spoof GPS to the exact grid point ─────────────────────────────────────
+    // This tells Google Maps "the user is physically standing here" — same signal
+    // as a real customer searching from that location. No zoom tricks needed.
+    // Google reads navigator.geolocation and uses it as the primary location signal.
+    try {
+        await page.context().setGeolocation({ latitude: lat, longitude: lng });
+        await page.context().grantPermissions(['geolocation'], { origin: 'https://www.google.com' });
+    } catch { /* non-critical — fall back to URL anchor */ }
+
+    const url = buildGridPointUrl(keyword, lat, lng, language);
 
     // ── Navigate ──────────────────────────────────────────────────────────────
     // On timeout we don't bail immediately — partial page loads often still

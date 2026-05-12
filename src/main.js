@@ -17,7 +17,7 @@
 
 import { Actor, log } from 'apify';
 import { PlaywrightCrawler, sleep } from 'crawlee';
-import { generateGridPoints, getZoomForSpacing } from './generateGrid.js';
+import { generateGridPoints } from './generateGrid.js';
 import { checkRankAtPoint }     from './scrapeRank.js';
 import { normaliseTargetIds }   from './extractPlaceId.js';
 
@@ -218,13 +218,12 @@ function makeRequestHandler({ jitterMs, passLabel }) {
 
         const result = await checkRankAtPoint({
             page,
-            keyword:       request.userData.keyword,
-            lat:           point.lat,
-            lng:           point.lng,
+            keyword:      request.userData.keyword,
+            lat:          point.lat,
+            lng:          point.lng,
             targetIds,
             maxRankToShow,
-            language:      request.userData.language,
-            spacingMeters: gridSpacingMeters,
+            language:     request.userData.language,
         });
 
         if (result.error && RETRYABLE_ERRORS.some(e => result.error.startsWith(e))) {
@@ -295,7 +294,7 @@ async function runCrawler({ requests, concurrency, retries, requestTimeoutSecs, 
 // ─── Primary pass ─────────────────────────────────────────────────────────────
 
 const primaryRequests = gridPoints.map((pt) => ({
-    url:      `https://www.google.com/maps/search/${encodeURIComponent(keyword)}/@${pt.lat},${pt.lng},${getZoomForSpacing(gridSpacingMeters)}z?hl=${language}`,
+    url:      `https://www.google.com/maps/search/${encodeURIComponent(keyword)}/@${pt.lat},${pt.lng},15z?hl=${language}`,
     label:    'GRID_POINT',
     userData: { point: pt, keyword, language },
 }));
@@ -321,7 +320,7 @@ if (erroredPoints.length > 0) {
     log.info(`Second pass: retrying ${erroredPoints.length} errored point(s) at lower concurrency…`);
 
     const retryRequests = erroredPoints.map((pt) => ({
-        url:      `https://www.google.com/maps/search/${encodeURIComponent(keyword)}/@${pt.lat},${pt.lng},${getZoomForSpacing(gridSpacingMeters)}z?hl=${language}`,
+        url:      `https://www.google.com/maps/search/${encodeURIComponent(keyword)}/@${pt.lat},${pt.lng},15z?hl=${language}`,
         label:    'GRID_POINT',
         userData: { point: pt, keyword, language },
     }));
