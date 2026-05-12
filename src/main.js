@@ -179,6 +179,11 @@ const gridResults = new Array(gridPoints.length).fill(null);
 const RETRYABLE_ERRORS = ['no_feed', 'nav_timeout', 'feed_lost', 'consent_bypass_failed', 'captcha'];
 
 const SHARED_LAUNCH_CONTEXT = {
+    // CRITICAL: each request gets its OWN incognito browser context. Without
+    // this, concurrent cells share one context and their setGeolocation() calls
+    // race — verified: 6/9 cells were scraping with wrong GPS coords. Each
+    // incognito context has isolated cookies, storage, AND geolocation state.
+    useIncognitoPages: true,
     launchOptions: {
         headless: true,
         args: [
