@@ -155,7 +155,13 @@ const gridResults = new Array(gridPoints.length).fill(null);
 
 const RETRYABLE_ERRORS = ['no_feed', 'nav_timeout', 'feed_lost', 'consent_bypass_failed', 'captcha'];
 
+// Mobile emulation: ~85% of Indian local searches happen on mobile, so we scrape
+// the mobile Maps experience that real customers actually see. iPhone Safari is
+// the most common UA and least likely to be flagged as bot traffic.
+const MOBILE_USER_AGENT = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1';
+
 const SHARED_LAUNCH_CONTEXT = {
+    userAgent: MOBILE_USER_AGENT,
     launchOptions: {
         headless: true,
         args: [
@@ -178,13 +184,14 @@ const SHARED_LAUNCH_CONTEXT = {
 
 const SHARED_PRE_NAV_HOOKS = [
     async ({ page }) => {
-        // Smaller viewport = fewer map tile requests. Combined with imagesEnabled=false
-        // this is belt-and-suspenders — tiles won't load anyway, but smaller DOM layout
-        // also reduces CSS/reflow overhead per page.
-        await page.setViewportSize({ width: 960, height: 600 });
+        // iPhone 13 viewport — matches the UA above. Also smaller than desktop,
+        // which means less DOM/CSS work per page.
+        await page.setViewportSize({ width: 390, height: 844 });
 
         await page.addInitScript(() => {
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            // Touch support — completes the mobile fingerprint
+            Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 5 });
         });
         await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
         // Pre-set SOCS cookie to bypass Google's GDPR/EU consent page.

@@ -34,6 +34,28 @@ const MAX_SCROLL_ROUNDS = 4;      // 4 scrolls covers ~28 results (well past max
 const NAV_TIMEOUT_MS    = 45000;
 const SCROLL_WAIT_MAX   = 1000;   // waitForFunction timeout per scroll round
 
+// ─── Geo helpers ──────────────────────────────────────────────────────────────
+
+/** Extract lat,lng from a Google Maps URL's @lat,lng,zoom pattern. */
+function extractCoordsFromMapsUrl(url) {
+    if (!url) return null;
+    const m = url.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/);
+    if (!m) return null;
+    return { lat: parseFloat(m[1]), lng: parseFloat(m[2]) };
+}
+
+/** Haversine distance in metres between two lat/lng points. */
+function haversineMeters(lat1, lng1, lat2, lng2) {
+    const R = 6371000; // Earth radius in metres
+    const toRad = (d) => (d * Math.PI) / 180;
+    const phi1 = toRad(lat1);
+    const phi2 = toRad(lat2);
+    const dPhi = toRad(lat2 - lat1);
+    const dLng = toRad(lng2 - lng1);
+    const a = Math.sin(dPhi / 2) ** 2 + Math.cos(phi1) * Math.cos(phi2) * Math.sin(dLng / 2) ** 2;
+    return Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+}
+
 // ─── URL ID extractor (Node.js side) ─────────────────────────────────────────
 
 function extractIdsFromUrl(url) {
@@ -456,21 +478,30 @@ export async function checkRankAtPoint({
                              || null;
                 // Extract placeId + hexId from the Maps URL at zero extra cost
                 const urlIds = mapsUrl ? extractIdsFromUrl(mapsUrl) : {};
+                // Extract the competitor's own coordinates from their mapsUrl
+                // and compute distance from this grid point — pure math, no network.
+                const compCoords = extractCoordsFromMapsUrl(mapsUrl);
+                const distanceMeters = compCoords
+                    ? haversineMeters(lat, lng, compCoords.lat, compCoords.lng)
+                    : null;
                 competitors.push({
-                    rank:        effectiveRank,
-                    name:        card.name,
-                    cid:         card.dataCid || urlIds.cid || null,
-                    placeId:     urlIds.placeId || null,
-                    hexId:       urlIds.hexId   || null,
+                    rank:           effectiveRank,
+                    name:           card.name,
+                    cid:            card.dataCid || urlIds.cid || null,
+                    placeId:        urlIds.placeId || null,
+                    hexId:          urlIds.hexId   || null,
                     mapsUrl,
-                    websiteUrl:  card.websiteUrl  || null,
-                    rating:      card.rating      ?? null,
-                    reviewCount: card.reviewCount ?? null,
-                    category:    card.category    || null,
-                    address:     card.address     || null,
-                    priceLevel:  card.priceLevel  || null,
-                    openStatus:  card.openStatus  || null,
-                    isSponsored: card.isSponsored ?? false,
+                    websiteUrl:     card.websiteUrl  || null,
+                    rating:         card.rating      ?? null,
+                    reviewCount:    card.reviewCount ?? null,
+                    category:       card.category    || null,
+                    address:        card.address     || null,
+                    priceLevel:     card.priceLevel  || null,
+                    openStatus:     card.openStatus  || null,
+                    isSponsored:    card.isSponsored ?? false,
+                    lat:            compCoords?.lat ?? null,
+                    lng:            compCoords?.lng ?? null,
+                    distanceMeters,
                 });
             }
 
