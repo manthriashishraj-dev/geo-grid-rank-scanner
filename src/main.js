@@ -292,6 +292,10 @@ function makeRequestHandler({ jitterMs, passLabel }) {
             rank:       result.rank,
             ranked:     result.ranked,
             competitors: result.competitors || [],
+            // Verification: what Google's navigator.geolocation actually saw.
+            // If geoDriftMeters is large (>100m), our spoof isn't being honored.
+            geoSeen:        result.geoSeen        || null,
+            geoDriftMeters: result.geoDriftMeters ?? null,
             ...(result.error ? { error: result.error } : {}),
             ...(geoFailed   ? { geoFailed: true } : {}),
         };

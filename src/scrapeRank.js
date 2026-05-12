@@ -52,6 +52,49 @@ function extractCoordsFromMapsUrl(url) {
     return { lat: parseFloat(pin[1]), lng: parseFloat(pin[2]) };
 }
 
+/**
+ * Verify what coordinates the page's navigator.geolocation API actually returns.
+ *
+ * This is the SAME API Google Maps reads to determine "the user's location".
+ * If our setGeolocation() spoof is working, this returns our spoofed coords.
+ * If Google is using IP location or some other signal, this will return
+ * something else (or error).
+ *
+ * Result: { lat, lng, source: 'geo'|'denied'|'unavailable'|'timeout'|'error' }
+ *         OR null if the eval itself failed.
+ */
+async function verifyGeolocation(page) {
+    try {
+        return await page.evaluate(() => new Promise((resolve) => {
+            if (!navigator.geolocation) {
+                resolve({ lat: null, lng: null, source: 'unavailable' });
+                return;
+            }
+            // 3s timeout — geolocation calls can hang forever in headless contexts
+            const tid = setTimeout(() => resolve({ lat: null, lng: null, source: 'timeout' }), 3000);
+            navigator.geolocation.getCurrentPosition(
+                (pos) => {
+                    clearTimeout(tid);
+                    resolve({
+                        lat: pos.coords.latitude,
+                        lng: pos.coords.longitude,
+                        source: 'geo',
+                    });
+                },
+                (err) => {
+                    clearTimeout(tid);
+                    // err.code 1=denied, 2=unavailable, 3=timeout
+                    const map = { 1: 'denied', 2: 'unavailable', 3: 'timeout' };
+                    resolve({ lat: null, lng: null, source: map[err.code] || 'error' });
+                },
+                { timeout: 2500, maximumAge: 0 },
+            );
+        }));
+    } catch {
+        return null;
+    }
+}
+
 /** Haversine distance in metres between two lat/lng points. */
 function haversineMeters(lat1, lng1, lat2, lng2) {
     const R = 6371000; // Earth radius in metres
@@ -215,6 +258,18 @@ export async function checkRankAtPoint({
 
     await sleep(200); // brief settle for initial DOM paint
 
+    // ── GPS verification ──────────────────────────────────────────────────────
+    // Ask the page what coords it sees via navigator.geolocation. This is the
+    // exact API Google Maps reads — if our setGeolocation spoof is working,
+    // we should get back our target coords. If not, we know the spoof failed
+    // and the rank reading at this cell is meaningless.
+    const geoSeen = await verifyGeolocation(page);
+    const geoDriftMeters = (geoSeen && geoSeen.lat != null)
+        ? haversineMeters(lat, lng, geoSeen.lat, geoSeen.lng)
+        : null;
+    // Helper so every return path picks up the geo verification fields.
+    const withGeo = (r) => ({ ...r, geoSeen, geoDriftMeters });
+
     // ── Page state check ──────────────────────────────────────────────────────
     let state = await detectPageState(page);
 
@@ -224,18 +279,18 @@ export async function checkRankAtPoint({
         await sleep(800); // reduced from 1500ms
         state = await detectPageState(page);
         if (state === 'consent') {
-            return { rank: null, ranked: false, error: 'consent_bypass_failed', competitors: [] };
+            return withGeo({ rank: null, ranked: false, error: 'consent_bypass_failed', competitors: [] });
         }
     }
 
     // Captcha → retryable (different proxy IP on retry)
     if (state === 'captcha') {
-        return { rank: null, ranked: false, error: 'captcha', competitors: [] };
+        return withGeo({ rank: null, ranked: false, error: 'captcha', competitors: [] });
     }
 
     // Legitimate "no results in this area" → clean not-ranked, not an error
     if (state === 'no_results') {
-        return { rank: null, ranked: false, competitors: [] };
+        return withGeo({ rank: null, ranked: false, competitors: [] });
     }
 
     // ── Wait for feed ─────────────────────────────────────────────────────────
@@ -243,10 +298,10 @@ export async function checkRankAtPoint({
 
     if (!feedReady) {
         const finalState = await detectPageState(page);
-        if (finalState === 'no_results') return { rank: null, ranked: false, competitors: [] };
-        if (finalState === 'consent')    return { rank: null, ranked: false, error: 'consent_bypass_failed', competitors: [] };
-        if (finalState === 'captcha')    return { rank: null, ranked: false, error: 'captcha', competitors: [] };
-        return { rank: null, ranked: false, error: 'no_feed', competitors: [] };
+        if (finalState === 'no_results') return withGeo({ rank: null, ranked: false, competitors: [] });
+        if (finalState === 'consent')    return withGeo({ rank: null, ranked: false, error: 'consent_bypass_failed', competitors: [] });
+        if (finalState === 'captcha')    return withGeo({ rank: null, ranked: false, error: 'captcha', competitors: [] });
+        return withGeo({ rank: null, ranked: false, error: 'no_feed', competitors: [] });
     }
 
     await sleep(300); // reduced from 800ms — feed selector confirmed present
@@ -422,8 +477,8 @@ export async function checkRankAtPoint({
 
         if (!extracted.feedExists && round === 0) {
             const s = await detectPageState(page);
-            if (s === 'no_results') return { rank: null, ranked: false, competitors: [] };
-            return { rank: null, ranked: false, error: 'feed_lost', competitors: [] };
+            if (s === 'no_results') return withGeo({ rank: null, ranked: false, competitors: [] });
+            return withGeo({ rank: null, ranked: false, error: 'feed_lost', competitors: [] });
         }
 
         const { cards, totalCards } = extracted;
@@ -485,18 +540,18 @@ export async function checkRankAtPoint({
             }
 
             if (effectiveRank > maxRankToShow) {
-                return { rank: null, ranked: false, competitors };
+                return withGeo({ rank: null, ranked: false, competitors });
             }
 
             // 1 ▸ data-cid direct match
             if (card.dataCid) {
                 if (targetIds.cid && card.dataCid === targetIds.cid) {
-                    return { rank: effectiveRank, ranked: true, competitors: competitors.filter(c => c.rank < effectiveRank) };
+                    return withGeo({ rank: effectiveRank, ranked: true, competitors: competitors.filter(c => c.rank < effectiveRank) });
                 }
                 if (targetIds.hexId) {
                     try {
                         if (card.dataCid === BigInt(targetIds.hexId.split(':')[1]).toString()) {
-                            return { rank: effectiveRank, ranked: true, competitors: competitors.filter(c => c.rank < effectiveRank) };
+                            return withGeo({ rank: effectiveRank, ranked: true, competitors: competitors.filter(c => c.rank < effectiveRank) });
                         }
                     } catch { /* malformed */ }
                 }
@@ -507,7 +562,7 @@ export async function checkRankAtPoint({
                 const cardIds = extractIdsFromUrl(href);
                 if (!cardIds.placeId && !cardIds.hexId && !cardIds.cid) continue;
                 if (idsMatch(targetIds, cardIds)) {
-                    return { rank: effectiveRank, ranked: true, competitors: competitors.filter(c => c.rank < effectiveRank) };
+                    return withGeo({ rank: effectiveRank, ranked: true, competitors: competitors.filter(c => c.rank < effectiveRank) });
                 }
             }
 
@@ -515,14 +570,14 @@ export async function checkRankAtPoint({
             if (card.jslog && targetIds.cid) {
                 const m = card.jslog.match(/\b(\d{15,20})\b/);
                 if (m && m[1] === targetIds.cid) {
-                    return { rank: effectiveRank, ranked: true, competitors: competitors.filter(c => c.rank < effectiveRank) };
+                    return withGeo({ rank: effectiveRank, ranked: true, competitors: competitors.filter(c => c.rank < effectiveRank) });
                 }
             }
         }
 
         // Seen enough results without a match — stop
         if (effectiveRank >= maxRankToShow) {
-            return { rank: null, ranked: false, competitors };
+            return withGeo({ rank: null, ranked: false, competitors });
         }
 
         // ── Backup scroll via Playwright mouse wheel ──────────────────────────
@@ -558,5 +613,5 @@ export async function checkRankAtPoint({
         prevTotalCards = totalCards;
     }
 
-    return { rank: null, ranked: false, competitors };
+    return withGeo({ rank: null, ranked: false, competitors });
 }
