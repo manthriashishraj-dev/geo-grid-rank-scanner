@@ -60,29 +60,47 @@ if (!googleMapsUrl && !placeId && !cid && !hexId) {
     );
 }
 
+// ─── Validate gridSize ────────────────────────────────────────────────────────
+// Must be ODD and >=3 — even grids produce an off-center "center" that biases
+// quadrant analysis. Also enforce an upper bound to prevent runaway runs.
+if (!Number.isInteger(gridSize) || gridSize % 2 === 0 || gridSize < 3 || gridSize > 11) {
+    throw new Error(
+        `gridSize must be an odd integer between 3 and 11 (got ${gridSize}). ` +
+        `Common values: 3 (9 pts, hyper-local), 5 (25 pts), 7 (49 pts), 9 (81 pts).`
+    );
+}
+
 // ─── Auto-extract center coordinates from Google Maps URL ─────────────────────
 // If centerLat/centerLng weren't provided manually, extract them from the URL.
-// Full Maps URL contains /@lat,lng,zoom — short URLs (maps.app.goo.gl) are
-// followed via a HEAD redirect to get the final URL first.
+// IMPORTANT: use `??` not `||` — lat/lng `0` (equator/prime meridian) is valid.
 
-let resolvedLat = centerLat || null;
-let resolvedLng = centerLng || null;
+let resolvedLat = centerLat ?? null;
+let resolvedLng = centerLng ?? null;
 
-if ((!resolvedLat || !resolvedLng) && googleMapsUrl) {
+if ((resolvedLat == null || resolvedLng == null) && googleMapsUrl) {
     const directMatch = googleMapsUrl.match(/@(-?\d+\.?\d*),(-?\d+\.?\d*),/);
     if (directMatch) {
-        resolvedLat = resolvedLat || parseFloat(directMatch[1]);
-        resolvedLng = resolvedLng || parseFloat(directMatch[2]);
+        resolvedLat ??= parseFloat(directMatch[1]);
+        resolvedLng ??= parseFloat(directMatch[2]);
         log.info(`Auto-extracted center from URL: ${resolvedLat}, ${resolvedLng}`);
     } else {
         try {
-            const resp = await fetch(googleMapsUrl, { method: 'HEAD', redirect: 'follow' });
+            // Add timeout + UA so the URL-shortener fetch can't hang the actor.
+            const resp = await fetch(googleMapsUrl, {
+                method:   'HEAD',
+                redirect: 'follow',
+                headers:  { 'User-Agent': 'Mozilla/5.0 (compatible; geo-grid-rank-scanner)' },
+                signal:   AbortSignal.timeout(8000),
+            });
             const finalUrl = resp.url;
-            const redirectMatch = finalUrl.match(/@(-?\d+\.?\d*),(-?\d+\.?\d*),/);
-            if (redirectMatch) {
-                resolvedLat = resolvedLat || parseFloat(redirectMatch[1]);
-                resolvedLng = resolvedLng || parseFloat(redirectMatch[2]);
-                log.info(`Auto-extracted center from redirect URL: ${resolvedLat}, ${resolvedLng}`);
+            // Only trust the redirect if it actually landed on a google.com Maps host.
+            if (/^https?:\/\/(www\.|maps\.)?google\.[a-z.]+\/maps/.test(finalUrl)) {
+                const redirectMatch = finalUrl.match(/@(-?\d+\.?\d*),(-?\d+\.?\d*),/);
+                if (redirectMatch) {
+                    resolvedLat ??= parseFloat(redirectMatch[1]);
+                    resolvedLng ??= parseFloat(redirectMatch[2]);
+                    log.info(`Auto-extracted center from redirect URL: ${resolvedLat}, ${resolvedLng}`);
+                }
             }
         } catch (e) {
             log.warning(`Could not follow URL redirect for coordinate extraction: ${e.message}`);
@@ -90,12 +108,17 @@ if ((!resolvedLat || !resolvedLng) && googleMapsUrl) {
     }
 }
 
-if (!resolvedLat || !resolvedLng) {
+if (resolvedLat == null || resolvedLng == null) {
     throw new Error(
         '"centerLat" and "centerLng" are required.\n' +
         'Either enter them manually, or paste a full Google Maps URL that contains\n' +
         'coordinates in its path (e.g. /@17.38,78.48,14z).'
     );
+}
+
+// Sanity-check the coordinates are on Earth.
+if (resolvedLat < -90 || resolvedLat > 90 || resolvedLng < -180 || resolvedLng > 180) {
+    throw new Error(`centerLat/centerLng out of Earth range: ${resolvedLat}, ${resolvedLng}`);
 }
 
 // ─── Normalise target IDs ─────────────────────────────────────────────────────
@@ -177,7 +200,7 @@ const SHARED_LAUNCH_CONTEXT = {
 };
 
 const SHARED_PRE_NAV_HOOKS = [
-    async ({ page }) => {
+    async ({ page, request }) => {
         // Smaller viewport = fewer map tile requests. Combined with imagesEnabled=false
         // this is belt-and-suspenders — tiles won't load anyway, but smaller DOM layout
         // also reduces CSS/reflow overhead per page.
@@ -198,6 +221,23 @@ const SHARED_PRE_NAV_HOOKS = [
             }]);
         } catch { /* context may not be ready */ }
 
+        // ── GPS spoof — MUST happen before Crawlee navigates ──────────────────
+        // This is the primary location signal Google Maps uses for local ranking.
+        // grantPermissions is called WITHOUT an origin filter so it applies to
+        // every google.* subdomain (consent.google.com, www.google.co.in, etc).
+        const point = request.userData?.point;
+        if (point && typeof point.lat === 'number' && typeof point.lng === 'number') {
+            try {
+                await page.context().grantPermissions(['geolocation']);
+                await page.context().setGeolocation({ latitude: point.lat, longitude: point.lng });
+            } catch (e) {
+                // Loud failure — geolocation is the foundation of the scanner.
+                // We flag the request so the handler can surface it in the dataset
+                // instead of returning silently-incorrect data.
+                log.error(`[geolocation] FAILED for point ${point.pointIndex} (row ${point.row}, col ${point.col}): ${e.message}`);
+                request.userData.geoFailed = true;
+            }
+        }
     },
 ];
 
@@ -226,7 +266,19 @@ function makeRequestHandler({ jitterMs, passLabel }) {
             language:     request.userData.language,
         });
 
+        // If geolocation failed in preNavigationHooks, the rank reading is
+        // unreliable — surface this in the dataset so consumers can detect it.
+        const geoFailed = request.userData?.geoFailed === true;
+
+        // For RETRYABLE errors we want Crawlee to retry this request — throw so
+        // it goes back to the queue. But first capture any competitors we DID
+        // collect, so the failedRequestHandler can use them if all retries fail.
         if (result.error && RETRYABLE_ERRORS.some(e => result.error.startsWith(e))) {
+            // Stash partial result on the request so failedRequestHandler can recover it
+            request.userData.lastPartial = {
+                competitors: result.competitors || [],
+                geoFailed,
+            };
             throw new Error(`retryable: ${result.error}`);
         }
 
@@ -241,6 +293,7 @@ function makeRequestHandler({ jitterMs, passLabel }) {
             ranked:     result.ranked,
             competitors: result.competitors || [],
             ...(result.error ? { error: result.error } : {}),
+            ...(geoFailed   ? { geoFailed: true } : {}),
         };
 
         crawlerLog.info(result.ranked
@@ -261,12 +314,17 @@ function makeFailedHandler({ passLabel, keepExisting }) {
         const { point } = request.userData;
         const existing = gridResults[point.pointIndex];
         if (keepExisting && existing && !existing.error) return; // preserve successful first-pass result
+        // If we collected partial competitor data before the final retry failed,
+        // preserve it so the run isn't a total loss for this cell.
+        const partial = request.userData?.lastPartial || {};
         gridResults[point.pointIndex] = {
             pointIndex: point.pointIndex,
             row: point.row, col: point.col,
             lat: point.lat, lng: point.lng,
             quadrant: point.quadrant,
-            rank: null, ranked: false, error: 'request_failed', competitors: [],
+            rank: null, ranked: false, error: 'request_failed',
+            competitors: partial.competitors || [],
+            ...(partial.geoFailed ? { geoFailed: true } : {}),
         };
     };
 }
@@ -285,7 +343,14 @@ async function runCrawler({ requests, concurrency, retries, requestTimeoutSecs, 
         preNavigationHooks:        SHARED_PRE_NAV_HOOKS,
         requestHandler:            makeRequestHandler({ jitterMs, passLabel }),
         failedRequestHandler:      makeFailedHandler({ passLabel, keepExisting: passLabel !== '' }),
-
+        // Session pool: each session = one residential IP. We want a DISTINCT
+        // session per cell so Google can't see "the same user teleporting".
+        // maxUsageCount=1 forces session rotation after every request.
+        useSessionPool:    true,
+        sessionPoolOptions: {
+            maxPoolSize:    200,
+            sessionOptions: { maxUsageCount: 1 },
+        },
     });
     await crawler.addRequests(requests);
     await crawler.run();
@@ -422,22 +487,35 @@ const summary = {
 
 // ─── Output ───────────────────────────────────────────────────────────────────
 
-await Actor.pushData({
-    keyword,
-    businessName:   displayName,
-    targetIds,
-    centerLat:      resolvedLat,
-    centerLng:      resolvedLng,
-    gridSize,
-    gridSpacingMeters,
-    maxRankToShow,
-    proxyCountry:   proxyCountry || 'auto',
-    scanDate:       new Date().toISOString().split('T')[0],
-    scanTimestamp:  new Date().toISOString(),
-    gridResults:    annotatedResults,
-    gridMatrix,
-    summary,
-});
+// Count cells flagged as geoFailed so consumers can see data-quality issues at a glance.
+const geoFailedCount = annotatedResults.filter((p) => p.geoFailed).length;
+if (geoFailedCount > 0) {
+    log.warning(`⚠️  ${geoFailedCount}/${totalPoints} cells had geolocation failures — their rank readings are unreliable`);
+}
+
+try {
+    await Actor.pushData({
+        keyword,
+        businessName:    displayName,
+        targetIds,
+        centerLat:       resolvedLat,
+        centerLng:       resolvedLng,
+        gridSize,
+        gridSpacingMeters,
+        maxRankToShow,
+        proxyCountry:    proxyCountry || 'auto',
+        scanDate:        new Date().toISOString().split('T')[0],
+        scanTimestamp:   new Date().toISOString(),
+        gridResults:     annotatedResults,
+        gridMatrix,
+        summary:         { ...summary, geoFailedCount },
+    });
+} catch (e) {
+    log.error(`Actor.pushData FAILED: ${e.message}`);
+    // Re-throw so Apify marks the run as FAILED — otherwise we'd exit "succeeded"
+    // with no data, which would silently break downstream consumers.
+    throw e;
+}
 
 log.info('=== Scan Complete ===');
 log.info(`Visibility: ${summary.visibilityScoreLabel} | Visible: ${visibleCount} | Weak: ${weakCount} | Invisible: ${invisibleCount}`);

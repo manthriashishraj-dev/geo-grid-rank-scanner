@@ -26,7 +26,7 @@
  */
 
 import { sleep } from 'crawlee';
-import { idsMatch } from './extractPlaceId.js';
+import { idsMatch, extractAllIdsFromUrl } from './extractPlaceId.js';
 import { buildGridPointUrl } from './generateGrid.js';
 
 const CARD_WAIT_MS      = 10000;
@@ -37,21 +37,19 @@ const SCROLL_WAIT_MAX   = 1000;   // waitForFunction timeout per scroll round
 // ─── Geo helpers ──────────────────────────────────────────────────────────────
 
 /**
- * Extract lat,lng from a Google Maps URL.
- * Google uses two formats for business cards:
- *   1. /@lat,lng,zoom — viewport anchor
- *   2. !3d{lat}!4d{lng} in the data param — actual business pin coordinates
- * The data-param form is more accurate (true pin location, not viewport).
+ * Extract a business's actual pin lat/lng from its Google Maps URL.
+ * ONLY uses the data-param `!3d{lat}!4d{lng}` pattern — that is the real pin.
+ *
+ * We intentionally do NOT fall back to the viewport `@lat,lng`: that pattern is
+ * the map-view centre (which equals OUR grid point for these search URLs) and
+ * would give a misleading distance of ~0m for every competitor missing pin
+ * data. Returning null is much more useful than wrong data.
  */
 function extractCoordsFromMapsUrl(url) {
     if (!url) return null;
-    // Try pin coordinates first (most accurate)
     const pin = url.match(/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/);
-    if (pin) return { lat: parseFloat(pin[1]), lng: parseFloat(pin[2]) };
-    // Fall back to viewport anchor
-    const at = url.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/);
-    if (at) return { lat: parseFloat(at[1]), lng: parseFloat(at[2]) };
-    return null;
+    if (!pin) return null;
+    return { lat: parseFloat(pin[1]), lng: parseFloat(pin[2]) };
 }
 
 /** Haversine distance in metres between two lat/lng points. */
@@ -67,39 +65,10 @@ function haversineMeters(lat1, lng1, lat2, lng2) {
 }
 
 // ─── URL ID extractor (Node.js side) ─────────────────────────────────────────
-
-function extractIdsFromUrl(url) {
-    if (!url) return { placeId: null, hexId: null, cid: null };
-
-    let placeId = null;
-    let hexId   = null;
-    let cid     = null;
-
-    // 1. Hex-pair: !1s0x...:0x...
-    const hexMatch = url.match(/!1s(0x[a-f0-9]+:0x[a-f0-9]+)/i);
-    if (hexMatch) {
-        hexId = hexMatch[1].toLowerCase();
-        const cidHex = hexId.split(':')[1];
-        if (cidHex) {
-            try { cid = BigInt(cidHex).toString(); } catch { /* malformed */ }
-        }
-    }
-
-    // 2. ChIJ Place ID
-    const chijPath = url.match(/maps\/place\/[^/]*\/(ChIJ[A-Za-z0-9_-]{10,})/);
-    if (chijPath) {
-        placeId = chijPath[1];
-    } else {
-        const chijRaw = url.match(/(ChIJ[A-Za-z0-9_-]{10,})/);
-        if (chijRaw) placeId = chijRaw[1];
-    }
-
-    // 3. ?cid= numeric
-    const cidParam = url.match(/[?&]cid=(\d+)/);
-    if (cidParam) cid = cidParam[1];
-
-    return { placeId, hexId, cid };
-}
+// Re-exports the canonical extractor from extractPlaceId.js so we have ONE
+// source of truth — earlier we had a near-duplicate copy here that was already
+// starting to drift (no BigInt try-wrapping, etc.).
+const extractIdsFromUrl = extractAllIdsFromUrl;
 
 // ─── Page state detection ─────────────────────────────────────────────────────
 // Returns one of: 'feed' | 'consent' | 'no_results' | 'captcha' | 'unknown'
@@ -229,27 +198,22 @@ export async function checkRankAtPoint({
     maxRankToShow = 20,
     language      = 'en',
 }) {
-    // ── Spoof GPS to the exact grid point ─────────────────────────────────────
-    // This tells Google Maps "the user is physically standing here" — same signal
-    // as a real customer searching from that location. No zoom tricks needed.
-    // Google reads navigator.geolocation and uses it as the primary location signal.
-    try {
-        await page.context().setGeolocation({ latitude: lat, longitude: lng });
-        await page.context().grantPermissions(['geolocation'], { origin: 'https://www.google.com' });
-    } catch { /* non-critical — fall back to URL anchor */ }
-
-    const url = buildGridPointUrl(keyword, lat, lng, language);
-
-    // ── Navigate ──────────────────────────────────────────────────────────────
-    // On timeout we don't bail immediately — partial page loads often still
-    // have result cards we can scan.
-    try {
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
-    } catch {
-        // Timeout or navigation error — fall through and try to scan whatever loaded
+    // Crawlee has ALREADY navigated to the request URL by the time we get here,
+    // and preNavigationHooks has set the geolocation BEFORE that navigation.
+    // We do NOT navigate again — that would be a wasted page load doubling cost.
+    //
+    // Safety net: if for any reason the page didn't land on a google.com URL
+    // (proxy redirect chain, blocked, etc.), re-navigate once with the canonical
+    // search URL so we never silently scrape a wrong page.
+    const expectedUrl = buildGridPointUrl(keyword, lat, lng, language);
+    const currentUrl  = page.url() || '';
+    if (!/^https?:\/\/(www\.|maps\.)?google\.[a-z.]+\/maps\/search/.test(currentUrl)) {
+        try {
+            await page.goto(expectedUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+        } catch { /* timeout ok — partial loads often still scrape */ }
     }
 
-    await sleep(200); // reduced from 600ms — just enough for initial DOM paint
+    await sleep(200); // brief settle for initial DOM paint
 
     // ── Page state check ──────────────────────────────────────────────────────
     let state = await detectPageState(page);
@@ -557,14 +521,15 @@ export async function checkRankAtPoint({
         }
 
         // ── Smart wait: exit as soon as new cards appear (max SCROLL_WAIT_MAX ms) ──
-        // This replaces the old fixed sleep(1500ms). If cards load in 300ms we move
-        // immediately; if the feed is exhausted we exit after 1 second.
+        // Selector mirrors the three layouts detectPageState recognises so a page
+        // using the [data-cid]-only layout doesn't time out every round.
         await page.waitForFunction(
             (expectedCount) => {
                 const feed = document.querySelector('[role="feed"]');
                 const n = feed
                     ? feed.querySelectorAll(':scope > div').length
-                    : document.querySelectorAll('[role="article"]').length;
+                    : (document.querySelectorAll('[role="article"]').length
+                       || document.querySelectorAll('[data-cid]').length);
                 return n > expectedCount;
             },
             totalCards,
