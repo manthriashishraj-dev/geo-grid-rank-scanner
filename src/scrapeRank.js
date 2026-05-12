@@ -30,9 +30,9 @@ import { idsMatch, extractAllIdsFromUrl } from './extractPlaceId.js';
 import { buildGridPointUrl } from './generateGrid.js';
 
 const CARD_WAIT_MS      = 10000;
-const MAX_SCROLL_ROUNDS = 10;     // 10 scrolls — enough for 30+ results even on slow lazy-load
+const MAX_SCROLL_ROUNDS = 6;      // 6 rounds reliably reaches 20 results; plateau hits at 4-5
 const NAV_TIMEOUT_MS    = 45000;
-const SCROLL_WAIT_MAX   = 1500;   // waitForFunction timeout per scroll round
+const SCROLL_WAIT_MAX   = 1000;   // waitForFunction timeout per scroll round
 
 // ─── Geo helpers ──────────────────────────────────────────────────────────────
 

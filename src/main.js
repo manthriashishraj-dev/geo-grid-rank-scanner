@@ -352,14 +352,12 @@ async function runCrawler({ requests, concurrency, retries, requestTimeoutSecs, 
         preNavigationHooks:        SHARED_PRE_NAV_HOOKS,
         requestHandler:            makeRequestHandler({ jitterMs, passLabel }),
         failedRequestHandler:      makeFailedHandler({ passLabel, keepExisting: passLabel !== '' }),
-        // Session pool: each session = one residential IP. We want a DISTINCT
-        // session per cell so Google can't see "the same user teleporting".
-        // maxUsageCount=1 forces session rotation after every request.
-        useSessionPool:    true,
-        sessionPoolOptions: {
-            maxPoolSize:    200,
-            sessionOptions: { maxUsageCount: 1 },
-        },
+        // No explicit session pool config: with useIncognitoPages:true (set in
+        // SHARED_LAUNCH_CONTEXT) each cell already gets a fresh incognito
+        // browser context. Apify RESIDENTIAL proxies rotate IPs per-request by
+        // default, so each context gets a different IP automatically.
+        // Adding maxUsageCount:1 here was redundant and ~doubled per-cell
+        // overhead with no correctness benefit.
     });
     await crawler.addRequests(requests);
     await crawler.run();
