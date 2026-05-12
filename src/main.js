@@ -211,22 +211,6 @@ const SHARED_PRE_NAV_HOOKS = [
         // also reduces CSS/reflow overhead per page.
         await page.setViewportSize({ width: 960, height: 600 });
 
-        // ── Aggressive resource blocking — saves ~30-40% proxy bandwidth ──────
-        // Images are already blocked at the engine level. Here we additionally
-        // abort fonts, media, analytics, ads, and tracking pixels. CSS is kept
-        // because the card extraction relies on .fontHeadlineSmall etc.
-        await page.route('**/*', (route) => {
-            const type = route.request().resourceType();
-            const url  = route.request().url();
-            if (type === 'font' || type === 'media' || type === 'image') {
-                return route.abort();
-            }
-            if (/google-analytics\.com|googletagmanager\.com|doubleclick\.net|googleadservices\.com|googlesyndication\.com|google\.com\/(?:gen_204|log)/.test(url)) {
-                return route.abort();
-            }
-            return route.continue();
-        });
-
         await page.addInitScript(() => {
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         });
@@ -389,7 +373,7 @@ const primaryRequests = gridPoints.map((pt) => ({
 
 await runCrawler({
     requests:           primaryRequests,
-    concurrency:        8,  // bumped from 5 — cuts wall time → cuts compute cost
+    concurrency:        5,
     retries:            2,
     requestTimeoutSecs: 150,
     navTimeoutSecs:     60,
