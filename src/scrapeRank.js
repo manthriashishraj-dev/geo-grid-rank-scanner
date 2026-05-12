@@ -30,9 +30,9 @@ import { idsMatch, extractAllIdsFromUrl } from './extractPlaceId.js';
 import { buildGridPointUrl } from './generateGrid.js';
 
 const CARD_WAIT_MS      = 10000;
-const MAX_SCROLL_ROUNDS = 4;      // 4 scrolls covers ~28 results (well past maxRankToShow=20)
+const MAX_SCROLL_ROUNDS = 10;     // 10 scrolls — enough for 30+ results even on slow lazy-load
 const NAV_TIMEOUT_MS    = 45000;
-const SCROLL_WAIT_MAX   = 1000;   // waitForFunction timeout per scroll round
+const SCROLL_WAIT_MAX   = 1500;   // waitForFunction timeout per scroll round
 
 // ─── Geo helpers ──────────────────────────────────────────────────────────────
 
@@ -429,6 +429,11 @@ export async function checkRankAtPoint({
         const { cards, totalCards } = extracted;
 
         // ── Match check (Node.js side) ────────────────────────────────────────
+        // CRITICAL: each scroll round re-extracts ALL visible cards from scratch,
+        // so we must RESET the competitors list each round. Otherwise rank-N
+        // cards get pushed multiple times across rounds → 51 unique businesses
+        // become 1045 duplicate entries.
+        competitors = [];
         let effectiveRank = 0;
 
         for (const card of cards) {
@@ -520,6 +525,15 @@ export async function checkRankAtPoint({
             return { rank: null, ranked: false, competitors };
         }
 
+        // ── Backup scroll via Playwright mouse wheel ──────────────────────────
+        // The in-page feed.scrollBy() sometimes doesn't fire the scroll events
+        // Google's IntersectionObserver listens for. A real mouse wheel event
+        // covers that gap. Coordinates point into the feed column.
+        try {
+            await page.mouse.move(200, 400);
+            await page.mouse.wheel(0, 2000);
+        } catch { /* non-critical */ }
+
         // ── Smart wait: exit as soon as new cards appear (max SCROLL_WAIT_MAX ms) ──
         // Selector mirrors the three layouts detectPageState recognises so a page
         // using the [data-cid]-only layout doesn't time out every round.
@@ -537,7 +551,10 @@ export async function checkRankAtPoint({
         ).catch(() => {}); // timeout = no new cards = plateau; loop handles it
 
         // ── Plateau detection: stop if feed didn't grow ───────────────────────
-        if (totalCards <= prevTotalCards && round > 0) break;
+        // Compare against prev round's count AFTER waiting. If still equal, the
+        // feed is exhausted (or our scrolls aren't triggering load, in which
+        // case nothing more we can do here).
+        if (totalCards === prevTotalCards && round > 0) break;
         prevTotalCards = totalCards;
     }
 
