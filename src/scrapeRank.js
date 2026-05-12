@@ -36,12 +36,22 @@ const SCROLL_WAIT_MAX   = 1000;   // waitForFunction timeout per scroll round
 
 // ─── Geo helpers ──────────────────────────────────────────────────────────────
 
-/** Extract lat,lng from a Google Maps URL's @lat,lng,zoom pattern. */
+/**
+ * Extract lat,lng from a Google Maps URL.
+ * Google uses two formats for business cards:
+ *   1. /@lat,lng,zoom — viewport anchor
+ *   2. !3d{lat}!4d{lng} in the data param — actual business pin coordinates
+ * The data-param form is more accurate (true pin location, not viewport).
+ */
 function extractCoordsFromMapsUrl(url) {
     if (!url) return null;
-    const m = url.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/);
-    if (!m) return null;
-    return { lat: parseFloat(m[1]), lng: parseFloat(m[2]) };
+    // Try pin coordinates first (most accurate)
+    const pin = url.match(/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/);
+    if (pin) return { lat: parseFloat(pin[1]), lng: parseFloat(pin[2]) };
+    // Fall back to viewport anchor
+    const at = url.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/);
+    if (at) return { lat: parseFloat(at[1]), lng: parseFloat(at[2]) };
+    return null;
 }
 
 /** Haversine distance in metres between two lat/lng points. */
