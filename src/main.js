@@ -373,7 +373,7 @@ const primaryRequests = gridPoints.map((pt) => ({
 
 await runCrawler({
     requests:           primaryRequests,
-    concurrency:        5,
+    concurrency:        8,  // bumped from 5 — cuts wall time → cuts compute cost
     retries:            2,
     requestTimeoutSecs: 150,
     navTimeoutSecs:     60,
